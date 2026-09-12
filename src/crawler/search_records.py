@@ -1,21 +1,26 @@
 """
-Busca registros na BDTD.
+Coleta URLs de registros da BDTD a partir da busca por uma área/termo.
 
-A consulta padrão utiliza:
+Esta etapa corresponde ao início da camada Raw do pipeline.
 
-    lookfor=Direito
-    type=AllFields
-
-Os links encontrados são armazenados em:
-
+Fluxo:
+    BDTD
+      ↓
+    página de resultados
+      ↓
+    URLs dos registros
+      ↓
     data/raw/metadata/record_urls.json
 
-ou no diretório definido pela variável BDTD_DATA_DIR.
+A busca padrão utilizada no projeto é:
+    lookfor=Direito
+    type=AllFields
 """
 
 import json
 from datetime import datetime, timezone
-from urllib.parse import urlencode
+from pathlib import Path
+from urllib.parse import urlencode, urljoin
 
 from playwright.sync_api import sync_playwright
 
@@ -23,23 +28,24 @@ from src.config import (
     BDTD_HEADLESS,
     BDTD_MAX_RECORDS,
     BDTD_QUERY,
-    PAGE_TIMEOUT,
     RECORD_URLS_FILE,
     create_directories,
 )
 
 
-BASE_SEARCH_URL = (
-    "https://bdtd.ibict.br/vufind/Search/Results"
-)
+BASE_URL = "https://bdtd.ibict.br"
+SEARCH_URL = f"{BASE_URL}/vufind/Search/Results"
 
 
-def build_search_url(
-    query: str,
-    page_number: int,
-) -> str:
+def build_search_url(query: str, page_number: int) -> str:
     """
-    Cria a URL de busca da BDTD.
+    Monta a URL de busca da BDTD.
+
+    Exemplo:
+    https://bdtd.ibict.br/vufind/Search/Results
+        ?lookfor=Direito
+        &type=AllFields
+        &page=1
     """
     params = {
         "lookfor": query,
@@ -47,71 +53,71 @@ def build_search_url(
         "page": page_number,
     }
 
-    return (
-        f"{BASE_SEARCH_URL}?"
-        f"{urlencode(params)}"
-    )
+    return f"{SEARCH_URL}?{urlencode(params)}"
 
 
-def normalize_record_url(
-    href: str,
-) -> str | None:
+def extract_record_links(page) -> list[str]:
     """
-    Converte links relativos de registros em URLs absolutas.
+    Extrai os links dos registros existentes na página atual.
+
+    Em vez de depender de classes CSS específicas da interface,
+    percorremos todos os links e selecionamos aqueles cujo href
+    contém '/vufind/Record/'.
+
+    Isso torna o crawler menos dependente da estrutura visual
+    da página da BDTD.
     """
-    if not href:
-        return None
+    links = page.locator("a")
 
-    if "/vufind/Record/" not in href:
-        return None
+    record_urls = []
 
-    if href.startswith("http://") or href.startswith("https://"):
-        return href
+    for index in range(links.count()):
+        href = links.nth(index).get_attribute("href")
 
-    if href.startswith("/"):
-        return (
-            "https://bdtd.ibict.br"
-            + href
-        )
+        if not href:
+            continue
 
-    return (
-        "https://bdtd.ibict.br/"
-        + href.lstrip("/")
-    )
+        if "/vufind/Record/" not in href:
+            continue
+
+        absolute_url = urljoin(BASE_URL, href)
+
+        if absolute_url not in record_urls:
+            record_urls.append(absolute_url)
+
+    return record_urls
 
 
 def save_record_urls(
-    urls: list[str],
+    record_urls: list[str],
+    output_file: Path,
 ) -> None:
     """
-    Salva as URLs coletadas.
-
-    Não utiliza arquivo .tmp como entrada posteriormente.
+    Salva os registros coletados em JSON.
     """
-    RECORD_URLS_FILE.parent.mkdir(
+    output_file.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    payload = {
+    data = {
         "source": "BDTD",
         "query": BDTD_QUERY,
         "search_type": "AllFields",
-        "collected_at": (
-            datetime.now(timezone.utc)
-            .isoformat()
-        ),
-        "total_collected": len(urls),
-        "record_urls": urls,
+        "collected_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "total_collected": len(record_urls),
+        "record_urls": record_urls,
     }
 
     with open(
-        RECORD_URLS_FILE,
+        output_file,
         "w",
         encoding="utf-8",
     ) as file:
         json.dump(
-            payload,
+            data,
             file,
             ensure_ascii=False,
             indent=2,
@@ -120,96 +126,86 @@ def save_record_urls(
 
 def run() -> None:
     """
-    Executa a busca paginada da BDTD.
+    Executa a busca na BDTD até atingir BDTD_MAX_RECORDS.
+
+    O processo percorre as páginas de resultados e acumula
+    URLs únicas de registros.
     """
     create_directories()
 
-    collected_urls: list[str] = []
-    collected_set: set[str] = set()
-
     print(f"Consulta: {BDTD_QUERY}")
-    print(
-        f"Limite: {BDTD_MAX_RECORDS}"
-    )
+    print(f"Limite: {BDTD_MAX_RECORDS}")
+    print()
+
+    collected_urls = []
+    seen_urls = set()
+
+    page_number = 1
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
             headless=BDTD_HEADLESS,
         )
 
-        page = browser.new_page()
-
-        page.set_default_timeout(
-            PAGE_TIMEOUT,
+        context = browser.new_context(
+            viewport={
+                "width": 1440,
+                "height": 900,
+            }
         )
 
-        page_number = 1
+        page = context.new_page()
 
-        while (
-            len(collected_urls)
-            < BDTD_MAX_RECORDS
-        ):
-            url = build_search_url(
+        while len(collected_urls) < BDTD_MAX_RECORDS:
+            current_url = build_search_url(
                 BDTD_QUERY,
                 page_number,
             )
 
-            print(
-                f"\nPágina {page_number}"
-            )
-            print(url)
+            print(f"Página {page_number}")
+            print(current_url)
 
             try:
                 page.goto(
-                    url,
+                    current_url,
                     wait_until="domcontentloaded",
-                    timeout=PAGE_TIMEOUT,
+                    timeout=60000,
                 )
 
-                page.wait_for_timeout(1500)
+                # Dá tempo para os resultados terminarem de aparecer.
+                page.wait_for_timeout(3000)
 
             except Exception as error:
                 print(
-                    "Erro ao abrir página:",
-                    error,
+                    f"Erro ao abrir página {page_number}: "
+                    f"{error}"
                 )
-
                 break
 
-            anchors = page.locator(
-                'a[href*="/vufind/Record/"]'
+            print(
+                "Título:",
+                page.title(),
             )
 
-            count = anchors.count()
+            page_record_urls = extract_record_links(
+                page
+            )
 
-            new_on_page = 0
+            print(
+                "Encontrados na página:",
+                len(page_record_urls),
+            )
 
-            for index in range(count):
-                href = anchors.nth(
-                    index
-                ).get_attribute("href")
+            new_records = 0
 
-                record_url = (
-                    normalize_record_url(
-                        href
-                    )
-                )
-
-                if not record_url:
+            for record_url in page_record_urls:
+                if record_url in seen_urls:
                     continue
 
-                if record_url in collected_set:
-                    continue
+                seen_urls.add(record_url)
+                collected_urls.append(record_url)
 
-                collected_set.add(
-                    record_url
-                )
-
-                collected_urls.append(
-                    record_url
-                )
-
-                new_on_page += 1
+                new_records += 1
 
                 if (
                     len(collected_urls)
@@ -218,41 +214,48 @@ def run() -> None:
                     break
 
             print(
-                f"Encontrados na página: {count}"
-            )
-            print(
-                f"Novos: {new_on_page}"
-            )
-            print(
-                f"Total coletado: "
-                f"{len(collected_urls)}"
+                "Novos:",
+                new_records,
             )
 
-            if count == 0:
+            print(
+                "Total coletado:",
+                len(collected_urls),
+            )
+
+            print()
+
+            if not page_record_urls:
                 print(
                     "Nenhum registro encontrado "
                     "na página."
                 )
                 break
 
-            if new_on_page == 0:
+            if new_records == 0:
                 print(
-                    "Nenhum registro novo. "
-                    "Encerrando paginação."
+                    "Nenhum registro novo encontrado. "
+                    "Encerrando para evitar loop."
                 )
                 break
 
             page_number += 1
 
+        context.close()
         browser.close()
 
+    # Respeita exatamente o limite solicitado.
+    collected_urls = collected_urls[
+        :BDTD_MAX_RECORDS
+    ]
+
     save_record_urls(
-        collected_urls[
-            :BDTD_MAX_RECORDS
-        ]
+        collected_urls,
+        RECORD_URLS_FILE,
     )
 
-    print("\nBusca finalizada.")
+    print()
+    print("Busca finalizada.")
     print(
         "Registros:",
         len(collected_urls),
