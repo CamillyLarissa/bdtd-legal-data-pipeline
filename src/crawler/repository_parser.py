@@ -1,214 +1,679 @@
-"""Descoberta de PDFs em repositórios institucionais."""
+"""
+Descoberta de PDFs nos repositórios institucionais.
+
+Responsabilidades:
+- abrir páginas dos repositórios;
+- consultar DSpace moderno;
+- descobrir links candidatos;
+- ordenar candidatos;
+- tentar baixar o PDF encontrado.
+
+Não percorre os registros da BDTD.
+Essa responsabilidade pertence ao downloader.py.
+"""
 
 import re
-from urllib.parse import urljoin, urlparse
+import time
+
+from urllib.parse import (
+    urljoin,
+    urlparse,
+)
 
 import requests
 
-from src.config import BDTD_PAGE_TIMEOUT, BDTD_REQUEST_TIMEOUT
+
 from src.crawler.download_utils import (
-    HEADERS, download_with_browser_context, download_with_requests,
+    HEADERS,
+    MAX_RETRIES,
+    PAGE_TIMEOUT,
+    REQUEST_TIMEOUT,
+    RETRY_WAIT_SECONDS,
+    alternative_urls,
+    download_with_browser_context,
+    download_with_requests,
+    is_direct_pdf_url,
 )
 
-IGNORED_CANDIDATE_TERMS = {
-    "bitstream-request-a-copy", "file-download-link", "item.edit.bitstreams",
-    "item.page.filesection", "statistics.table", "submission.sections",
-}
+from src.crawler.repository_detection import (
+    detect_special_page,
+    score_candidate,
+    valid_candidate_url,
+)
 
 
-def result(success, reason=None, source_url=None, pdf_url=None, path=None):
-    """Cria o contrato público padronizado do parser."""
+# ============================================================
+# DSPACE MODERNO
+# ============================================================
+
+
+def try_dspace_item_api(
+    repository_url,
+    output_file,
+):
+    """
+    Tenta localizar um PDF utilizando a API REST
+    do DSpace 7+.
+
+    É aplicável a URLs no formato:
+
+        /items/<uuid>
+    """
+
+    match = re.search(
+        r"/items/"
+        r"([0-9a-fA-F-]{36})",
+        repository_url,
+    )
+
+    if not match:
+        return {
+            "success": False,
+            "reason": "not_dspace_item",
+        }
+
+    item_uuid = match.group(1)
+
+    parsed = urlparse(
+        repository_url
+    )
+
+    base = (
+        f"{parsed.scheme}://"
+        f"{parsed.netloc}"
+    )
+
+    bundles_url = (
+        f"{base}"
+        f"/server/api/core/items/"
+        f"{item_uuid}/bundles"
+    )
+
+    try:
+
+        response = requests.get(
+            bundles_url,
+            headers=HEADERS,
+            timeout=REQUEST_TIMEOUT,
+            verify=False,
+        )
+
+        response.raise_for_status()
+
+        bundles = (
+            response.json()
+            .get("_embedded", {})
+            .get("bundles", [])
+        )
+
+        for bundle in bundles:
+
+            if (
+                bundle.get(
+                    "name",
+                    "",
+                ).upper()
+                != "ORIGINAL"
+            ):
+                continue
+
+            bundle_uuid = (
+                bundle.get("uuid")
+            )
+
+            if not bundle_uuid:
+                continue
+
+            bitstreams_url = (
+                f"{base}"
+                f"/server/api/core/"
+                f"bundles/{bundle_uuid}"
+                f"/bitstreams"
+            )
+
+            bitstream_response = (
+                requests.get(
+                    bitstreams_url,
+                    headers=HEADERS,
+                    timeout=REQUEST_TIMEOUT,
+                    verify=False,
+                )
+            )
+
+            bitstream_response.raise_for_status()
+
+            bitstreams = (
+                bitstream_response
+                .json()
+                .get("_embedded", {})
+                .get("bitstreams", [])
+            )
+
+            for bitstream in bitstreams:
+
+                filename = (
+                    bitstream.get(
+                        "name",
+                        "",
+                    )
+                )
+
+                uuid = bitstream.get(
+                    "uuid"
+                )
+
+                if not uuid:
+                    continue
+
+                if not filename.lower().endswith(
+                    ".pdf"
+                ):
+                    continue
+
+                pdf_url = (
+                    f"{base}"
+                    f"/server/api/core/"
+                    f"bitstreams/{uuid}"
+                    f"/content"
+                )
+
+                result = (
+                    download_with_requests(
+                        pdf_url,
+                        output_file,
+                        referer=repository_url,
+                    )
+                )
+
+                if result["success"]:
+                    return result
+
+    except Exception as error:
+
+        print(
+            "DSpace API falhou:",
+            error,
+        )
+
     return {
-        "success": success, "reason": reason, "source_url": source_url,
-        "pdf_url": pdf_url, "path": str(path) if path is not None else None,
+        "success": False,
+        "reason": (
+            "dspace_pdf_not_found"
+        ),
     }
 
 
-def alternative_urls(url):
-    urls = [url]
-    if url.startswith("http://"):
-        urls.append("https://" + url[len("http://"):])
-    return urls
+# ============================================================
+# COLETA DE CANDIDATOS
+# ============================================================
 
 
-def is_direct_pdf_url(url):
-    return url.lower().split("?", 1)[0].split("#", 1)[0].endswith(".pdf")
+def collect_candidates_from_links(
+    page,
+):
+    """
+    Procura URLs candidatas nos elementos
+    renderizados da página.
+    """
 
+    candidates = []
 
-def detect_special_page(page):
-    """Detecta bloqueios visíveis; não tenta contorná-los."""
-    try:
-        title = page.title().lower()
-    except Exception:
-        title = ""
-    try:
-        text = page.locator("body").inner_text(timeout=5000).lower()
-    except Exception:
-        text = ""
-    combined = f"{title}\n{text}"
-    anti_bot = (
-        "client verifying", "safeline waf", "checking your browser", "captcha",
-        "verificação de segurança", "verificacao de seguranca", "security detection",
-    )
-    if any(term in combined for term in anti_bot):
-        return "anti_bot"
-    # Expressões específicas evitam classificar strings internas da interface.
-    restricted = (
-        "tipo de acesso: acesso embargado", "acesso embargado",
-        "restricted access", "arquivo restrito", "acesso restrito",
-    )
-    if any(term in text for term in restricted):
-        return "restricted_or_embargo"
-    if any(term in combined for term in ("404 not found", "page not found", "página não encontrada")):
-        return "not_found"
-    if any(term in combined for term in ("service unavailable", "cannot connect to server")):
-        return "repository_unavailable"
-    return None
+    selectors = [
+        ("a[href]", "href"),
+        ("iframe[src]", "src"),
+        ("embed[src]", "src"),
+        ("object[data]", "data"),
+        ("source[src]", "src"),
+    ]
 
+    for selector, attribute in selectors:
 
-def score_candidate(url, text=""):
-    """Prioriza PDFs e bitstreams reais, rejeitando chaves internas/i18n."""
-    lower_url = url.lower()
-    lower_text = (text or "").lower()
-    if not lower_url.startswith(("http://", "https://")):
-        return -100
-    if any(term in lower_url or term in lower_text for term in IGNORED_CANDIDATE_TERMS):
-        return -100
-    score = 0
-    if ".pdf" in lower_url:
-        score += 40
-    if "/bitstream/" in lower_url or "/bitstreams/" in lower_url:
-        score += 30
-    if "download" in lower_url:
-        score += 20
-    if "pdf" in lower_text or "texto completo" in lower_text:
-        score += 15
-    return score
+        locator = page.locator(
+            selector
+        )
 
+        try:
+            count = locator.count()
 
-def find_pdf_candidates(page):
-    """Obtém candidatos dos links renderizados e do HTML da página."""
-    candidates = {}
-    try:
-        links = page.locator("a[href]")
-        for index in range(links.count()):
-            element = links.nth(index)
-            href = element.get_attribute("href")
-            if not href:
-                continue
-            url = urljoin(page.url, href)
+        except Exception:
+            continue
+
+        for index in range(count):
+
+            element = locator.nth(
+                index
+            )
+
             try:
-                text = element.inner_text().strip()
+
+                raw_url = (
+                    element.get_attribute(
+                        attribute
+                    )
+                )
+
+            except Exception:
+                raw_url = None
+
+            if not raw_url:
+                continue
+
+            url = urljoin(
+                page.url,
+                raw_url,
+            )
+
+            try:
+
+                text = (
+                    element.inner_text()
+                    .strip()
+                )
+
             except Exception:
                 text = ""
-            candidate_score = score_candidate(url, text)
-            if candidate_score > 0:
-                candidates[url] = max(candidates.get(url, -100), candidate_score)
-    except Exception:
-        pass
+
+            score = score_candidate(
+                url,
+                text,
+            )
+
+            if score > 0:
+
+                candidates.append(
+                    {
+                        "url": url,
+                        "text": text,
+                        "score": score,
+                    }
+                )
+
+    return candidates
+
+
+def collect_candidates_from_html(
+    page,
+):
+    """
+    Procura URLs candidatas diretamente
+    no HTML da página.
+    """
+
     try:
         html = page.content()
-        for found in re.findall(r'https?://[^\s"\'<>]+', html):
-            url = found.replace("&amp;", "&")
-            candidate_score = score_candidate(url)
-            if candidate_score > 0:
-                candidates[url] = max(candidates.get(url, -100), candidate_score)
+
     except Exception:
-        pass
-    return [url for url, _ in sorted(candidates.items(), key=lambda item: item[1], reverse=True)]
+        return []
 
+    candidates = []
 
-def try_download(context, url, output_file, source_url, referer=None):
-    for candidate_url in alternative_urls(url):
-        response = download_with_requests(candidate_url, output_file, referer, source_url)
-        if response["success"]:
-            return response
-        response = download_with_browser_context(context, candidate_url, output_file, referer, source_url)
-        if response["success"]:
-            return response
-    return result(False, "not_pdf", source_url, url)
+    patterns = [
+        (
+            r'https?://'
+            r'[^"\'<>\s]+'
+            r'\.pdf'
+            r'(?:\?[^"\'<>\s]*)?'
+        ),
+        (
+            r'["\']'
+            r'([^"\']*/bitstreams/'
+            r'[^"\']+/download)'
+            r'["\']'
+        ),
+        (
+            r'["\']'
+            r'([^"\']*/server/api/core/'
+            r'bitstreams/[^"\']+/content)'
+            r'["\']'
+        ),
+    ]
 
+    for pattern in patterns:
 
-def try_dspace_item_api(repository_url, output_file):
-    """Consulta a API de itens do DSpace moderno."""
-    match = re.search(r"/items/([0-9a-fA-F-]{36})", repository_url)
-    if not match:
-        return result(False, "not_dspace_item", repository_url)
-    parsed = urlparse(repository_url)
-    base = f"{parsed.scheme}://{parsed.netloc}"
-    try:
-        bundles_response = requests.get(
-            f"{base}/server/api/core/items/{match.group(1)}/bundles",
-            headers=HEADERS, timeout=BDTD_REQUEST_TIMEOUT, verify=False,
+        matches = re.findall(
+            pattern,
+            html,
+            flags=re.IGNORECASE,
         )
-        if not bundles_response.ok:
-            return result(False, "dspace_api_failed", repository_url)
-        bundles = bundles_response.json().get("_embedded", {}).get("bundles", [])
-        for bundle in bundles:
-            if bundle.get("name", "").upper() != "ORIGINAL" or not bundle.get("uuid"):
-                continue
-            bitstreams_response = requests.get(
-                f"{base}/server/api/core/bundles/{bundle['uuid']}/bitstreams",
-                headers=HEADERS, timeout=BDTD_REQUEST_TIMEOUT, verify=False,
+
+        for match in matches:
+
+            if isinstance(
+                match,
+                tuple,
+            ):
+                match = match[0]
+
+            url = urljoin(
+                page.url,
+                match,
             )
-            if not bitstreams_response.ok:
-                continue
-            bitstreams = bitstreams_response.json().get("_embedded", {}).get("bitstreams", [])
-            for bitstream in bitstreams:
-                uuid = bitstream.get("uuid")
-                if uuid and bitstream.get("name", "").lower().endswith(".pdf"):
-                    pdf_url = f"{base}/server/api/core/bitstreams/{uuid}/content"
-                    downloaded = download_with_requests(pdf_url, output_file, repository_url, repository_url)
-                    if downloaded["success"]:
-                        return downloaded
-    except requests.exceptions.Timeout:
-        return result(False, "timeout", repository_url)
-    except requests.exceptions.RequestException:
-        return result(False, "http_error", repository_url)
-    return result(False, "dspace_pdf_not_found", repository_url)
+
+            score = score_candidate(
+                url
+            )
+
+            if score > 0:
+
+                candidates.append(
+                    {
+                        "url": url,
+                        "text": "",
+                        "score": score,
+                    }
+                )
+
+    return candidates
 
 
-def open_repository(page, url):
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=BDTD_PAGE_TIMEOUT)
-        page.wait_for_timeout(3000)
-        return True
-    except Exception:
-        return False
+def find_pdf_candidates(
+    page,
+):
+    """
+    Combina os candidatos encontrados na página,
+    remove duplicatas e ordena pela pontuação.
+    """
+
+    candidates = []
+
+    candidates.extend(
+        collect_candidates_from_links(
+            page
+        )
+    )
+
+    candidates.extend(
+        collect_candidates_from_html(
+            page
+        )
+    )
+
+    candidates.sort(
+        key=lambda item: item[
+            "score"
+        ],
+        reverse=True,
+    )
+
+    seen = set()
+    result = []
+
+    for candidate in candidates:
+
+        url = candidate["url"]
+
+        if url in seen:
+            continue
+
+        if not valid_candidate_url(
+            url
+        ):
+            continue
+
+        seen.add(url)
+
+        result.append(
+            candidate
+        )
+
+    return result
 
 
-def process_repository_url(page, context, repository_url, output_file):
-    """Descobre e baixa o PDF mantendo um contrato único de resultado."""
-    if output_file.exists():
-        return result(True, source_url=repository_url, path=output_file)
-    if is_direct_pdf_url(repository_url):
-        direct = try_download(context, repository_url, output_file, repository_url)
-        if direct["success"]:
-            return direct
+# ============================================================
+# ABERTURA DO REPOSITÓRIO
+# ============================================================
+
+
+def open_repository(
+    page,
+    repository_url,
+):
+    """
+    Abre a página do repositório utilizando Playwright.
+
+    Faz pequenas tentativas antes de desistir.
+    """
+
+    for attempt in range(
+        1,
+        MAX_RETRIES + 1,
+    ):
+
+        try:
+
+            page.goto(
+                repository_url,
+                wait_until=(
+                    "domcontentloaded"
+                ),
+                timeout=PAGE_TIMEOUT,
+            )
+
+            page.wait_for_timeout(
+                3000
+            )
+
+            return True
+
+        except Exception as error:
+
+            print(
+                f"Falha ao abrir: "
+                f"{error}"
+            )
+
+            if attempt < MAX_RETRIES:
+
+                time.sleep(
+                    RETRY_WAIT_SECONDS
+                )
+
+    return False
+
+
+# ============================================================
+# PROCESSAMENTO DO REPOSITÓRIO
+# ============================================================
+
+
+def process_repository_url(
+    page,
+    context,
+    repository_url,
+    output_file,
+):
+    """
+    Processa uma URL externa fornecida pela BDTD
+    e tenta encontrar o PDF correspondente.
+
+    Este é o contrato principal utilizado pelo
+    downloader.py.
+    """
+
+    # --------------------------------------------------------
+    # PDF direto
+    # --------------------------------------------------------
+
+    if is_direct_pdf_url(
+        repository_url
+    ):
+
+        for url in alternative_urls(
+            repository_url
+        ):
+
+            result = (
+                download_with_requests(
+                    url,
+                    output_file,
+                )
+            )
+
+            if result["success"]:
+                return result
+
+        return {
+            "success": False,
+            "reason": (
+                "direct_pdf_failed"
+            ),
+        }
+
+    # --------------------------------------------------------
+    # DSpace moderno /items/<uuid>
+    # --------------------------------------------------------
+
     if "/items/" in repository_url:
-        dspace = try_dspace_item_api(repository_url, output_file)
-        if dspace["success"]:
-            return dspace
-    opened_url = repository_url
-    if not open_repository(page, opened_url) and repository_url.startswith("http://"):
-        opened_url = "https://" + repository_url[len("http://"):]
-        if not open_repository(page, opened_url):
-            return result(False, "repository_unavailable", repository_url)
-    elif not page.url:
-        return result(False, "repository_unavailable", repository_url)
-    special = detect_special_page(page)
+
+        result = try_dspace_item_api(
+            repository_url,
+            output_file,
+        )
+
+        if result["success"]:
+            return result
+
+    # --------------------------------------------------------
+    # Abre página do repositório
+    # --------------------------------------------------------
+
+    opened = open_repository(
+        page,
+        repository_url,
+    )
+
+    # Alguns repositórios antigos redirecionam melhor
+    # quando utilizados via HTTPS.
+    if (
+        not opened
+        and repository_url.startswith(
+            "http://"
+        )
+    ):
+
+        https_url = (
+            "https://"
+            + repository_url[
+                len("http://"):
+            ]
+        )
+
+        opened = open_repository(
+            page,
+            https_url,
+        )
+
+        if opened:
+            repository_url = (
+                https_url
+            )
+
+    if not opened:
+
+        return {
+            "success": False,
+            "reason": (
+                "repository_unavailable"
+            ),
+        }
+
+    print(
+        "Página:",
+        page.url,
+    )
+
+    # --------------------------------------------------------
+    # Verifica restrições / anti-bot
+    # --------------------------------------------------------
+
+    special = detect_special_page(
+        page
+    )
+
     if special:
-        return result(False, special, repository_url)
+
+        return {
+            "success": False,
+            "reason": special,
+        }
+
+    # --------------------------------------------------------
+    # Redirecionamento para DSpace moderno
+    # --------------------------------------------------------
+
     if "/items/" in page.url:
-        dspace = try_dspace_item_api(page.url, output_file)
-        if dspace["success"]:
-            dspace["source_url"] = repository_url
-            return dspace
-    for candidate in find_pdf_candidates(page)[:15]:
-        downloaded = try_download(context, candidate, output_file, repository_url, page.url)
-        if downloaded["success"]:
-            return downloaded
-    return result(False, "pdf_not_found", repository_url)
 
+        result = try_dspace_item_api(
+            page.url,
+            output_file,
+        )
 
-__all__ = ["detect_special_page", "find_pdf_candidates", "process_repository_url", "score_candidate"]
+        if result["success"]:
+            return result
+
+    # --------------------------------------------------------
+    # Procura links candidatos
+    # --------------------------------------------------------
+
+    candidates = find_pdf_candidates(
+        page
+    )
+
+    print(
+        "Candidatos válidos:",
+        len(candidates),
+    )
+
+    # Mantém o limite do código original.
+    for candidate in candidates[
+        :10
+    ]:
+
+        pdf_url = candidate[
+            "url"
+        ]
+
+        print(
+            "Tentando PDF:",
+            pdf_url,
+        )
+
+        for url in alternative_urls(
+            pdf_url
+        ):
+
+            # --------------------------------------------
+            # Primeira tentativa: requests
+            # --------------------------------------------
+
+            result = (
+                download_with_requests(
+                    url,
+                    output_file,
+                    referer=page.url,
+                )
+            )
+
+            if result["success"]:
+                return result
+
+            # --------------------------------------------
+            # Segunda tentativa: contexto Playwright
+            # --------------------------------------------
+
+            result = (
+                download_with_browser_context(
+                    context,
+                    url,
+                    output_file,
+                    referer=page.url,
+                )
+            )
+
+            if result["success"]:
+                return result
+
+    return {
+        "success": False,
+        "reason": "pdf_not_found",
+    }

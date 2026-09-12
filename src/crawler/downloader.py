@@ -1,5 +1,5 @@
 """
-Downloader dos PDFs associados aos registros da BDTD.
+Orquestrador de download dos PDFs da BDTD.
 
 Entrada:
     data/raw/metadata/records/*.json
@@ -9,28 +9,28 @@ Saída:
 
 Manifestos:
     data/raw/manifests/download_manifest.json
-    data/raw/manifests/download_failures.json
-
-Esta etapa pertence à camada Raw do pipeline.
+    data/raw/manifests/failed_downloads.json
 
 Responsabilidades deste arquivo:
-    - percorrer os metadados coletados;
-    - obter as URLs de acesso;
-    - chamar repository_parser.process_repository_url();
-    - salvar o resultado do download;
-    - registrar sucessos e falhas.
+- carregar os metadados;
+- percorrer os registros;
+- verificar PDFs existentes;
+- chamar repository_parser;
+- registrar sucesso e falha.
 
-A descoberta específica do PDF dentro de cada repositório
-fica em repository_parser.py.
+A lógica específica de descoberta dos PDFs não fica aqui.
 """
 
 import json
-from pathlib import Path
+import os
+import re
+import time
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import (
+    sync_playwright,
+)
 
 from src.config import (
-    BDTD_HEADLESS,
     MANIFEST_DIR,
     METADATA_DIR,
     PDF_DIR,
@@ -43,58 +43,64 @@ from src.crawler.repository_parser import (
 
 
 # ============================================================
-# Arquivos de manifesto
+# CONFIGURAÇÕES
 # ============================================================
 
-DOWNLOAD_MANIFEST_FILE = (
-    MANIFEST_DIR
-    / "download_manifest.json"
-)
-
-DOWNLOAD_FAILURES_FILE = (
-    MANIFEST_DIR
-    / "download_failures.json"
+MAX_RECORDS = int(
+    os.getenv(
+        "BDTD_MAX_RECORDS",
+        "100",
+    )
 )
 
 
+HEADLESS = (
+    os.getenv(
+        "BDTD_HEADLESS",
+        "false",
+    ).lower()
+    == "true"
+)
+
+
 # ============================================================
-# Utilidades
+# JSON
 # ============================================================
 
 
-def load_json(
-    file_path: Path,
-):
+def load_json(path):
     """
     Lê um arquivo JSON.
     """
 
     with open(
-        file_path,
+        path,
         "r",
         encoding="utf-8",
     ) as file:
+
         return json.load(file)
 
 
 def save_json(
-    file_path: Path,
+    path,
     data,
-) -> None:
+):
     """
-    Salva dados em JSON.
+    Salva um arquivo JSON.
     """
 
-    file_path.parent.mkdir(
+    path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     with open(
-        file_path,
+        path,
         "w",
         encoding="utf-8",
     ) as file:
+
         json.dump(
             data,
             file,
@@ -103,261 +109,134 @@ def save_json(
         )
 
 
-def split_access_urls(
-    value,
-) -> list[str]:
+def load_metadata_files():
     """
-    Converte access_url para uma lista de URLs.
-
-    Atualmente o extract_metadata deve produzir apenas uma URL,
-    mas esta função mantém compatibilidade com registros antigos
-    que possam possuir múltiplas URLs separadas por quebra de linha.
-
-    Exemplos:
-
-        "https://repositorio.exemplo/handle/123"
-
-    retorna:
-
-        [
-            "https://repositorio.exemplo/handle/123"
-        ]
-
-    E:
-
-        "url1\\nurl2"
-
-    retorna:
-
-        [
-            "url1",
-            "url2"
-        ]
+    Carrega os arquivos individuais de metadata,
+    respeitando BDTD_MAX_RECORDS.
     """
-
-    if value is None:
-        return []
-
-    # Caso algum metadata já possua lista.
-    if isinstance(
-        value,
-        list,
-    ):
-        raw_values = value
-
-    else:
-        raw_values = str(
-            value
-        ).splitlines()
-
-    urls = []
-    seen = set()
-
-    for raw_url in raw_values:
-
-        if raw_url is None:
-            continue
-
-        url = str(
-            raw_url
-        ).strip()
-
-        if not url:
-            continue
-
-        if not url.startswith(
-            (
-                "http://",
-                "https://",
-            )
-        ):
-            continue
-
-        if url in seen:
-            continue
-
-        seen.add(
-            url
-        )
-
-        urls.append(
-            url
-        )
-
-    return urls
-
-
-def get_metadata_files() -> list[Path]:
-    """
-    Retorna os JSONs individuais de metadata.
-    """
-
-    if not METADATA_DIR.exists():
-        return []
 
     return sorted(
         METADATA_DIR.glob(
             "*.json"
         )
-    )
-
-
-def create_manifest_entry(
-    record_id: str,
-    status: str,
-    reason=None,
-    source_url=None,
-    pdf_url=None,
-    pdf_path=None,
-) -> dict:
-    """
-    Cria uma entrada padronizada para o manifesto.
-    """
-
-    return {
-        "record_id": record_id,
-        "status": status,
-        "reason": reason,
-        "source_url": source_url,
-        "pdf_url": pdf_url,
-        "pdf_path": (
-            str(pdf_path)
-            if pdf_path
-            else None
-        ),
-    }
+    )[:MAX_RECORDS]
 
 
 # ============================================================
-# Execução
+# URLs
 # ============================================================
 
 
-def run() -> None:
+def split_access_urls(value):
     """
-    Executa o download dos PDFs disponíveis.
+    Extrai uma ou mais URLs do campo access_url.
 
-    Cada metadata deve possuir:
+    Mantém compatibilidade com metadados antigos
+    que podiam conter múltiplas URLs no mesmo campo.
+    """
 
-        record_id
-        access_url
+    if not value:
+        return []
 
-    O PDF é salvo como:
+    if isinstance(
+        value,
+        list,
+    ):
+        values = value
 
-        data/raw/pdf/<record_id>.pdf
+    else:
+        values = (
+            str(value)
+            .splitlines()
+        )
+
+    urls = []
+
+    for value in values:
+
+        matches = re.findall(
+            r"https?://[^\s]+",
+            str(value),
+        )
+
+        for url in matches:
+
+            url = url.strip()
+
+            if url not in urls:
+                urls.append(url)
+
+    return urls
+
+
+# ============================================================
+# EXECUÇÃO
+# ============================================================
+
+
+def run():
+    """
+    Executa o downloader para os registros encontrados
+    em data/raw/metadata/records.
     """
 
     create_directories()
 
     metadata_files = (
-        get_metadata_files()
+        load_metadata_files()
     )
 
     print(
-        "Metadados encontrados:",
-        len(metadata_files),
+        f"Metadados encontrados: "
+        f"{len(metadata_files)}"
     )
 
-    if not metadata_files:
-        print(
-            "Nenhum metadata encontrado."
-        )
-        return
+    print(
+        f"PDF_DIR: {PDF_DIR}"
+    )
 
-    manifest = []
-    failures = []
+    print(
+        f"HEADLESS: {HEADLESS}"
+    )
 
     downloaded_now = 0
-    already_existing = 0
+    already_exists = 0
     failed = 0
 
-    # --------------------------------------------------------
-    # Playwright
-    # --------------------------------------------------------
+    manifest = []
 
-    with sync_playwright() as playwright:
+    # ========================================================
+    # PLAYWRIGHT
+    # ========================================================
+
+    with sync_playwright() as p:
 
         browser = (
-            playwright.chromium.launch(
-                headless=BDTD_HEADLESS,
+            p.chromium.launch(
+                headless=HEADLESS
             )
         )
 
-        context = browser.new_context(
-            viewport={
-                "width": 1440,
-                "height": 900,
-            },
-            accept_downloads=True,
+        context = (
+            browser.new_context(
+                ignore_https_errors=True
+            )
         )
 
         page = context.new_page()
 
-        # ----------------------------------------------------
-        # Processamento dos registros
-        # ----------------------------------------------------
+        # ====================================================
+        # REGISTROS
+        # ====================================================
 
         for index, metadata_file in enumerate(
             metadata_files,
             start=1,
         ):
 
-            print()
-            print(
-                "=" * 60
+            metadata = load_json(
+                metadata_file
             )
-
-            try:
-                metadata = load_json(
-                    metadata_file
-                )
-
-            except Exception as error:
-
-                print(
-                    f"[{index}/"
-                    f"{len(metadata_files)}] "
-                    f"Erro ao ler metadata: "
-                    f"{error}"
-                )
-
-                failed += 1
-
-                entry = (
-                    create_manifest_entry(
-                        record_id=(
-                            metadata_file.stem
-                        ),
-                        status="failed",
-                        reason=(
-                            "metadata_read_error"
-                        ),
-                    )
-                )
-
-                manifest.append(
-                    entry
-                )
-
-                failures.append(
-                    entry
-                )
-
-                save_json(
-                    DOWNLOAD_MANIFEST_FILE,
-                    manifest,
-                )
-
-                save_json(
-                    DOWNLOAD_FAILURES_FILE,
-                    failures,
-                )
-
-                continue
-
-            # ------------------------------------------------
-            # Identificação
-            # ------------------------------------------------
 
             record_id = (
                 metadata.get(
@@ -366,52 +245,55 @@ def run() -> None:
                 or metadata_file.stem
             )
 
-            print(
-                f"[{index}/"
-                f"{len(metadata_files)}] "
-                f"{record_id}"
-            )
-
-            pdf_path = (
+            output_file = (
                 PDF_DIR
                 / f"{record_id}.pdf"
             )
 
+            print(
+                "\n"
+                + "=" * 70
+            )
+
+            print(
+                f"[{index}/"
+                f"{len(metadata_files)}]"
+            )
+
+            print(
+                f"Registro: {record_id}"
+            )
+
             # ------------------------------------------------
-            # PDF já existente
+            # PDF já existe
             # ------------------------------------------------
 
-            if pdf_path.exists():
-
-                already_existing += 1
-
-                entry = (
-                    create_manifest_entry(
-                        record_id=record_id,
-                        status=(
-                            "already_exists"
-                        ),
-                        pdf_path=pdf_path,
-                    )
-                )
-
-                manifest.append(
-                    entry
-                )
-
-                save_json(
-                    DOWNLOAD_MANIFEST_FILE,
-                    manifest,
-                )
+            if output_file.exists():
 
                 print(
                     "PDF já existe."
                 )
 
+                already_exists += 1
+
+                manifest.append(
+                    {
+                        "record_id": (
+                            record_id
+                        ),
+                        "status": (
+                            "already_exists"
+                        ),
+                        "pdf_path": str(
+                            output_file
+                        ),
+                    }
+                )
+
                 continue
 
             # ------------------------------------------------
-            # URLs externas
+            # URLs de acesso
             # ------------------------------------------------
 
             access_urls = (
@@ -426,71 +308,63 @@ def run() -> None:
 
                 failed += 1
 
-                entry = (
-                    create_manifest_entry(
-                        record_id=record_id,
-                        status="failed",
-                        reason="no_access_url",
-                    )
-                )
-
                 manifest.append(
-                    entry
-                )
-
-                failures.append(
-                    entry
-                )
-
-                save_json(
-                    DOWNLOAD_MANIFEST_FILE,
-                    manifest,
-                )
-
-                save_json(
-                    DOWNLOAD_FAILURES_FILE,
-                    failures,
+                    {
+                        "record_id": (
+                            record_id
+                        ),
+                        "status": (
+                            "no_access_url"
+                        ),
+                        "reason": (
+                            "no_access_url"
+                        ),
+                    }
                 )
 
                 print(
-                    "Nenhuma URL de acesso."
+                    "Sem URL de acesso."
                 )
 
                 continue
 
-            # ------------------------------------------------
-            # Tenta cada URL do registro
-            # ------------------------------------------------
+            success = False
 
-            final_result = None
+            final_reason = (
+                "unknown"
+            )
+
+            successful_url = None
+
+            # ------------------------------------------------
+            # Tenta cada URL disponível
+            # ------------------------------------------------
 
             for access_url in access_urls:
 
                 print(
-                    f"Tentando: "
-                    f"{access_url}"
+                    "\nTentando:"
+                )
+
+                print(
+                    access_url
                 )
 
                 try:
 
                     result = (
                         process_repository_url(
-                            page=page,
-                            context=context,
-                            repository_url=(
-                                access_url
-                            ),
-                            output_file=(
-                                pdf_path
-                            ),
+                            page,
+                            context,
+                            access_url,
+                            output_file,
                         )
                     )
 
                 except Exception as error:
 
                     print(
-                        "Erro durante "
-                        "processamento do "
+                        "Erro ao processar "
                         "repositório:",
                         error,
                     )
@@ -500,193 +374,145 @@ def run() -> None:
                         "reason": (
                             "repository_error"
                         ),
-                        "source_url": (
-                            access_url
-                        ),
-                        "pdf_url": None,
-                        "path": None,
                     }
 
-                final_result = (
-                    result
-                )
+                if result["success"]:
 
-                # --------------------------------------------
-                # Download realizado
-                # --------------------------------------------
+                    success = True
 
-                if result.get(
-                    "success"
-                ):
+                    successful_url = (
+                        access_url
+                    )
+
                     break
 
-                # --------------------------------------------
-                # Não tentar contornar bloqueios/restrições
-                # --------------------------------------------
+                final_reason = (
+                    result.get(
+                        "reason",
+                        "unknown",
+                    )
+                )
 
-                if result.get(
-                    "reason"
-                ) in {
+                print(
+                    "Falhou:",
+                    final_reason,
+                )
+
+                # Não há motivo para tentar contornar
+                # uma restrição explícita.
+                if final_reason in {
                     "restricted_or_embargo",
                     "anti_bot",
                 }:
                     break
 
             # ------------------------------------------------
-            # Sucesso
+            # SUCESSO
             # ------------------------------------------------
 
-            if (
-                final_result
-                and final_result.get(
-                    "success"
-                )
-            ):
+            if success:
 
                 downloaded_now += 1
 
-                saved_path = (
-                    final_result.get(
-                        "path"
-                    )
-                    or pdf_path
-                )
-
-                entry = (
-                    create_manifest_entry(
-                        record_id=record_id,
-                        status="downloaded",
-                        reason=(
-                            final_result.get(
-                                "reason"
-                            )
-                        ),
-                        source_url=(
-                            final_result.get(
-                                "source_url"
-                            )
-                        ),
-                        pdf_url=(
-                            final_result.get(
-                                "pdf_url"
-                            )
-                        ),
-                        pdf_path=(
-                            saved_path
-                        ),
-                    )
-                )
-
                 manifest.append(
-                    entry
+                    {
+                        "record_id": (
+                            record_id
+                        ),
+                        "status": (
+                            "downloaded"
+                        ),
+                        "source_url": (
+                            successful_url
+                        ),
+                        "pdf_path": str(
+                            output_file
+                        ),
+                    }
                 )
 
                 print(
-                    "PDF baixado."
+                    "PDF salvo:"
                 )
 
                 print(
-                    "Arquivo:",
-                    saved_path,
+                    output_file
                 )
 
             # ------------------------------------------------
-            # Falha
+            # FALHA
             # ------------------------------------------------
 
             else:
 
                 failed += 1
 
-                if final_result:
-
-                    reason = (
-                        final_result.get(
-                            "reason"
-                        )
-                        or "unknown_error"
-                    )
-
-                    source_url = (
-                        final_result.get(
-                            "source_url"
-                        )
-                    )
-
-                    pdf_url = (
-                        final_result.get(
-                            "pdf_url"
-                        )
-                    )
-
-                else:
-
-                    reason = (
-                        "no_download_attempt"
-                    )
-
-                    source_url = None
-                    pdf_url = None
-
-                entry = (
-                    create_manifest_entry(
-                        record_id=record_id,
-                        status="failed",
-                        reason=reason,
-                        source_url=(
-                            source_url
-                        ),
-                        pdf_url=(
-                            pdf_url
-                        ),
-                    )
-                )
-
                 manifest.append(
-                    entry
-                )
-
-                failures.append(
-                    entry
-                )
-
-                print(
-                    "Falha:"
-                )
-
-                print(
-                    "Motivo:",
-                    reason,
+                    {
+                        "record_id": (
+                            record_id
+                        ),
+                        "status": (
+                            "failed"
+                        ),
+                        "access_urls": (
+                            access_urls
+                        ),
+                        "reason": (
+                            final_reason
+                        ),
+                    }
                 )
 
             # ------------------------------------------------
-            # Salva progresso a cada registro
+            # Manifesto incremental
             # ------------------------------------------------
 
             save_json(
-                DOWNLOAD_MANIFEST_FILE,
+                MANIFEST_DIR
+                / "download_manifest.json",
                 manifest,
             )
 
-            save_json(
-                DOWNLOAD_FAILURES_FILE,
-                failures,
-            )
+            time.sleep(1)
 
-        # ----------------------------------------------------
-        # Encerramento Playwright
-        # ----------------------------------------------------
-
-        context.close()
         browser.close()
 
     # ========================================================
-    # Resultado final
+    # FALHAS
     # ========================================================
 
-    print()
+    failures = [
+        item
+        for item in manifest
+        if item["status"]
+        in {
+            "failed",
+            "no_access_url",
+        }
+    ]
+
+    save_json(
+        MANIFEST_DIR
+        / "failed_downloads.json",
+        failures,
+    )
+
+    total_pdfs = len(
+        list(
+            PDF_DIR.glob(
+                "*.pdf"
+            )
+        )
+    )
+
+    # ========================================================
+    # RESUMO
+    # ========================================================
+
     print(
-        "=" * 60
+        "\n"
+        + "=" * 70
     )
 
     print(
@@ -694,39 +520,22 @@ def run() -> None:
     )
 
     print(
-        "Baixados agora:",
-        downloaded_now,
+        f"Baixados agora: "
+        f"{downloaded_now}"
     )
 
     print(
-        "Já existentes:",
-        already_existing,
+        f"Já existentes: "
+        f"{already_exists}"
     )
 
     print(
-        "Falhas:",
-        failed,
+        f"Falhas: {failed}"
     )
 
     print(
-        "Total de PDFs:",
-        len(
-            list(
-                PDF_DIR.glob(
-                    "*.pdf"
-                )
-            )
-        ),
-    )
-
-    print(
-        "Manifesto:",
-        DOWNLOAD_MANIFEST_FILE,
-    )
-
-    print(
-        "Falhas:",
-        DOWNLOAD_FAILURES_FILE,
+        f"Total de PDFs: "
+        f"{total_pdfs}"
     )
 
 

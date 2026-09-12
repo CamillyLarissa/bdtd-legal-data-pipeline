@@ -1,224 +1,328 @@
 """
-Funções auxiliares para download de PDFs.
-
-Este módulo não extrai metadados e não conhece a lógica da BDTD.
+Utilidades para download de arquivos PDF.
 
 Responsabilidades:
-- realizar requisições HTTP;
-- validar se o conteúdo recebido é PDF;
-- salvar PDFs;
-- tentar download usando o contexto HTTP do Playwright.
+- configuração HTTP;
+- validação de conteúdo PDF;
+- geração de URLs alternativas;
+- download usando requests;
+- download usando o contexto do Playwright.
+
+Este módulo NÃO decide qual PDF pertence ao registro.
+Essa responsabilidade pertence ao repository_parser.py.
 """
 
+import os
+import time
 from pathlib import Path
 
 import requests
+import urllib3
 
-from src.config import (
-    MAX_RETRIES,
-    REQUEST_TIMEOUT,
+
+# ============================================================
+# CONFIGURAÇÕES
+# ============================================================
+
+REQUEST_TIMEOUT = 20
+PAGE_TIMEOUT = 30000
+
+MAX_RETRIES = 2
+RETRY_WAIT_SECONDS = 3
+
+
+urllib3.disable_warnings(
+    urllib3.exceptions.InsecureRequestWarning
 )
 
 
-DEFAULT_HEADERS = {
+HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 "
         "(Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 "
         "(KHTML, like Gecko) "
-        "Chrome/120 Safari/537.36"
-    )
+        "Chrome/152.0.0.0 "
+        "Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,"
+        "application/xhtml+xml,"
+        "application/xml;q=0.9,"
+        "application/pdf;q=0.8,"
+        "*/*;q=0.7"
+    ),
 }
 
-# Compatibilidade com versões anteriores do repository_parser
-HEADERS = DEFAULT_HEADERS
 
-def content_is_pdf(
-    content: bytes,
-    content_type: str | None = None,
-) -> bool:
-    """
-    Verifica se o conteúdo recebido parece ser um PDF.
+# ============================================================
+# URLs
+# ============================================================
 
-    São considerados:
-    - assinatura %PDF;
-    - Content-Type application/pdf.
+
+def alternative_urls(url):
     """
-    if content.startswith(
-        b"%PDF"
-    ):
-        return True
+    Retorna a URL original e, quando aplicável,
+    uma alternativa HTTPS.
+
+    Exemplo:
+
+        http://repositorio.exemplo/arquivo.pdf
+
+    gera:
+
+        [
+            "http://repositorio.exemplo/arquivo.pdf",
+            "https://repositorio.exemplo/arquivo.pdf",
+        ]
+    """
+
+    urls = [url]
+
+    if url.startswith("http://"):
+        https_url = (
+            "https://"
+            + url[len("http://"):]
+        )
+
+        urls.append(https_url)
+
+    return list(
+        dict.fromkeys(urls)
+    )
+
+
+def is_direct_pdf_url(url):
+    """
+    Verifica se a URL termina diretamente em .pdf.
+    """
+
+    clean = (
+        url.lower()
+        .split("?")[0]
+        .split("#")[0]
+    )
+
+    return clean.endswith(".pdf")
+
+
+# ============================================================
+# VALIDAÇÃO DE PDF
+# ============================================================
+
+
+def content_is_pdf_bytes(
+    content,
+    content_type="",
+):
+    """
+    Verifica se o conteúdo recebido realmente é PDF.
+
+    A validação utiliza:
+    - Content-Type application/pdf;
+    - assinatura binária %PDF.
+    """
 
     content_type = (
-        content_type
-        or ""
+        content_type or ""
     ).lower()
 
     return (
         "application/pdf"
         in content_type
+        or content.startswith(b"%PDF")
     )
 
 
-def save_pdf(
-    content: bytes,
-    destination: Path,
-) -> bool:
-    """
-    Salva um PDF.
-
-    Não sobrescreve arquivos válidos já existentes.
-    """
-    destination.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    if destination.exists():
-        try:
-            existing = (
-                destination.read_bytes()[:4]
-            )
-
-            if existing == b"%PDF":
-                return True
-        except OSError:
-            pass
-
-    temporary = destination.with_suffix(
-        destination.suffix + ".part"
-    )
-
-    try:
-        with open(
-            temporary,
-            "wb",
-        ) as file:
-            file.write(content)
-
-        temporary.replace(
-            destination
-        )
-
-        return True
-
-    except Exception:
-        if temporary.exists():
-            temporary.unlink(
-                missing_ok=True
-            )
-
-        raise
+# ============================================================
+# DOWNLOAD COM REQUESTS
+# ============================================================
 
 
 def download_with_requests(
-    url: str,
-    destination: Path,
-    session: requests.Session | None = None,
-) -> bool:
+    url,
+    output_file,
+    referer=None,
+):
     """
     Tenta baixar um PDF utilizando requests.
+
+    Args:
+        url:
+            URL candidata ao PDF.
+
+        output_file:
+            Path onde o PDF será salvo.
+
+        referer:
+            Página de origem, quando necessária.
+
+    Returns:
+        dict com:
+            success
+            url ou reason
     """
-    own_session = False
 
-    if session is None:
-        session = requests.Session()
-        own_session = True
+    headers = HEADERS.copy()
 
-    session.headers.update(
-        DEFAULT_HEADERS
-    )
+    if referer:
+        headers["Referer"] = referer
 
-    try:
-        for attempt in range(
-            1,
-            MAX_RETRIES + 1,
-        ):
-            try:
-                response = session.get(
-                    url,
-                    timeout=REQUEST_TIMEOUT,
-                    allow_redirects=True,
+    for attempt in range(
+        1,
+        MAX_RETRIES + 1,
+    ):
+        try:
+
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=True,
+                verify=False,
+            )
+
+            if response.status_code == 429:
+
+                time.sleep(
+                    RETRY_WAIT_SECONDS
+                    * attempt
                 )
 
-                if response.status_code >= 400:
-                    continue
+                continue
 
-                content_type = (
-                    response.headers.get(
-                        "Content-Type",
-                        "",
-                    )
+            response.raise_for_status()
+
+            content_type = (
+                response.headers.get(
+                    "Content-Type",
+                    "",
+                )
+            )
+
+            if not content_is_pdf_bytes(
+                response.content,
+                content_type,
+            ):
+                return {
+                    "success": False,
+                    "reason": "not_pdf",
+                }
+
+            output_file.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            output_file.write_bytes(
+                response.content
+            )
+
+            return {
+                "success": True,
+                "url": response.url,
+            }
+
+        except Exception as error:
+
+            print(
+                f"Erro de download: "
+                f"{error}"
+            )
+
+            if attempt < MAX_RETRIES:
+
+                time.sleep(
+                    RETRY_WAIT_SECONDS
+                    * attempt
                 )
 
-                if not content_is_pdf(
-                    response.content,
-                    content_type,
-                ):
-                    continue
+    return {
+        "success": False,
+        "reason": "request_failed",
+    }
 
-                return save_pdf(
-                    response.content,
-                    destination,
-                )
 
-            except requests.RequestException:
-                if (
-                    attempt
-                    >= MAX_RETRIES
-                ):
-                    return False
-
-        return False
-
-    finally:
-        if own_session:
-            session.close()
+# ============================================================
+# DOWNLOAD COM PLAYWRIGHT
+# ============================================================
 
 
 def download_with_browser_context(
     context,
-    url: str,
-    destination: Path,
-) -> bool:
+    url,
+    output_file,
+    referer=None,
+):
     """
-    Tenta baixar o conteúdo usando a camada HTTP do contexto
-    do Playwright.
+    Tenta baixar o PDF usando o contexto HTTP
+    do navegador Playwright.
 
-    Isso pode ajudar quando o navegador já possui cookies
-    obtidos durante a navegação normal.
+    É usado como fallback quando requests não
+    consegue acessar o arquivo.
     """
+
     try:
-        response = (
-            context.request.get(
-                url,
-                timeout=REQUEST_TIMEOUT
-                * 1000,
-            )
+
+        headers = {}
+
+        if referer:
+            headers["Referer"] = referer
+
+        response = context.request.get(
+            url,
+            headers=headers,
+            timeout=PAGE_TIMEOUT,
         )
 
         if not response.ok:
-            return False
+            return {
+                "success": False,
+                "reason": (
+                    f"http_{response.status}"
+                ),
+            }
 
-        content = response.body()
+        body = response.body()
 
         content_type = (
             response.headers.get(
                 "content-type",
-                ""
+                "",
             )
         )
 
-        if not content_is_pdf(
-            content,
+        if not content_is_pdf_bytes(
+            body,
             content_type,
         ):
-            return False
+            return {
+                "success": False,
+                "reason": "not_pdf",
+            }
 
-        return save_pdf(
-            content,
-            destination,
+        output_file.parent.mkdir(
+            parents=True,
+            exist_ok=True,
         )
 
-    except Exception:
-        return False
+        output_file.write_bytes(body)
+
+        return {
+            "success": True,
+            "url": url,
+        }
+
+    except Exception as error:
+
+        print(
+            "Browser context falhou:",
+            error,
+        )
+
+        return {
+            "success": False,
+            "reason": (
+                "browser_context_failed"
+            ),
+        }
