@@ -39,8 +39,8 @@ def valid_candidate_url(url):
     candidata real a um PDF.
 
     O filtro também remove strings internas de
-    interfaces DSpace que anteriormente estavam
-    sendo interpretadas como links.
+    interfaces DSpace que poderiam ser
+    interpretadas incorretamente como links.
     """
 
     if not url:
@@ -73,7 +73,8 @@ def valid_candidate_url(url):
         if fragment in lower:
             return False
 
-    # Regex quebradas podem produzir strings enormes.
+    # Evita strings muito grandes geradas por
+    # capturas incorretas de HTML.
     if len(url) > 1000:
         return False
 
@@ -178,7 +179,6 @@ def detect_special_page(page):
         title = ""
 
     try:
-
         body = (
             page.locator("body")
             .inner_text(
@@ -197,7 +197,7 @@ def detect_special_page(page):
     )
 
     # --------------------------------------------------------
-    # Anti-bot
+    # Anti-bot / validação de segurança
     # --------------------------------------------------------
 
     anti_bot_terms = [
@@ -208,10 +208,18 @@ def detect_special_page(page):
         "verificando conexao",
         "um momento…",
         "um momento...",
+
+        # UFSC - Sistema de Prevenção de Ataques
+        "sistema de prevenção de ataques da redeufsc",
+        "sistema de prevencao de ataques da redeufsc",
+        "por motivos de segurança, esta validação será solicitada",
+        "por motivos de seguranca, esta validacao sera solicitada",
+        "acesso ao site seja de fora da redeufsc",
+        "acesso ao site seja de fora da rede ufsc",
+        "redeufsc",
     ]
 
     for term in anti_bot_terms:
-
         if term in content:
             return "anti_bot"
 
@@ -228,7 +236,6 @@ def detect_special_page(page):
     ]
 
     for term in restriction_terms:
-
         if term in content:
             return (
                 "restricted_or_embargo"
@@ -244,7 +251,6 @@ def detect_special_page(page):
     ]
 
     for term in unavailable_terms:
-
         if term in content:
             return (
                 "repository_unavailable"
@@ -262,7 +268,6 @@ def detect_special_page(page):
     ]
 
     for term in not_found_terms:
-
         if term in content:
             return "not_found"
 
