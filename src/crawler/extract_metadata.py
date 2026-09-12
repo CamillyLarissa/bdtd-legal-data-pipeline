@@ -1,5 +1,5 @@
 """
-Extrai metadados das páginas de registros da BDTD.
+Extração dos metadados bibliográficos dos registros da BDTD.
 
 Entrada:
     data/raw/metadata/record_urls.json
@@ -7,183 +7,79 @@ Entrada:
 Saída:
     data/raw/metadata/records/<record_id>.json
 
-Esta etapa pertence à camada Raw. Os dados são preservados o mais
-próximo possível da fonte, sem normalizações semânticas.
+A extração é feita somente na seção "Detalhes bibliográficos"
+da página do registro, evitando confundir os metadados do trabalho
+com os campos do formulário de busca da BDTD.
 """
 
 import json
 import re
 from pathlib import Path
-from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
 from src.config import (
     BDTD_HEADLESS,
-    RECORD_URLS_FILE,
     METADATA_DIR,
+    RECORD_URLS_FILE,
     create_directories,
 )
 
 
 def normalize_space(value: str | None) -> str | None:
+    """
+    Remove espaços e quebras de linha excedentes.
+    """
     if value is None:
         return None
 
-    value = re.sub(r"\s+", " ", value).strip()
+    value = re.sub(
+        r"\s+",
+        " ",
+        value,
+    ).strip()
 
     return value or None
 
 
-def extract_record_id(record_url: str) -> str:
+def extract_record_id(
+    record_url: str,
+) -> str:
     """
-    Extrai o identificador a partir da URL do registro.
+    Extrai o identificador do registro a partir da URL.
 
     Exemplo:
-    https://bdtd.ibict.br/vufind/Record/UFSC_abc123
-        ->
-    UFSC_abc123
+        https://bdtd.ibict.br/vufind/Record/UFSC_abc123
+
+    Retorna:
+        UFSC_abc123
     """
-    return record_url.rstrip("/").split("/")[-1]
+    return (
+        record_url
+        .rstrip("/")
+        .split("/")[-1]
+    )
 
 
-def extract_title(page) -> str | None:
+def get_bibliographic_lines(
+    page,
+) -> list[str]:
     """
-    O título principal do trabalho normalmente aparece em um h1.
-    """
-    selectors = [
-        "h1",
-        ".record-title",
-        ".title",
-    ]
+    Obtém somente as linhas da seção
+    'Detalhes bibliográficos'.
 
-    for selector in selectors:
-        locator = page.locator(selector)
-
-        if locator.count() > 0:
-            text = normalize_space(
-                locator.first.inner_text()
-            )
-
-            if text:
-                return text
-
-    return None
-
-
-def extract_access_url(page) -> str | None:
-    """
-    Obtém somente o link referente ao documento/repositório.
-
-    Não coleta links institucionais, GOV.BR, redes sociais etc.
+    Isso evita capturar campos da interface de busca,
+    como:
+        Ano da publicação
+        Autor
+        Assunto
+        Resumo
     """
 
-    links = page.locator("a")
-
-    # Primeira estratégia:
-    # procura explicitamente o link "Acessar documento".
-    for index in range(links.count()):
-        link = links.nth(index)
-
-        try:
-            text = normalize_space(
-                link.inner_text()
-            ) or ""
-
-            href = link.get_attribute("href")
-
-        except Exception:
-            continue
-
-        if not href:
-            continue
-
-        text_lower = text.lower()
-
-        if (
-            "acessar documento" in text_lower
-            or "acesso ao documento" in text_lower
-            or "visualizar documento" in text_lower
-        ):
-            return href.strip()
-
-    # Fallback:
-    # procura links externos que não sejam infraestrutura do próprio IBICT.
-    ignored_domains = {
-        "bdtd.ibict.br",
-        "ibict.br",
-        "www.ibict.br",
-        "gov.br",
-        "www.gov.br",
-        "brasil.gov.br",
-        "www4.planalto.gov.br",
-        "translate.google.com",
-        "linkedin.com",
-        "www.linkedin.com",
-    }
-
-    for index in range(links.count()):
-        link = links.nth(index)
-
-        href = link.get_attribute("href")
-
-        if not href:
-            continue
-
-        href = href.strip()
-
-        if not href.startswith(
-            ("http://", "https://")
-        ):
-            continue
-
-        try:
-            domain = (
-                urlparse(href)
-                .netloc
-                .lower()
-            )
-        except Exception:
-            continue
-
-        if domain in ignored_domains:
-            continue
-
-        # Repositórios acadêmicos costumam aparecer
-        # em links contendo handle, repository,
-        # repositorio, tese etc.
-        href_lower = href.lower()
-
-        indicators = [
-            "handle",
-            "repositorio",
-            "repository",
-            "teses",
-            "tede",
-            ".pdf",
-        ]
-
-        if any(
-            indicator in href_lower
-            for indicator in indicators
-        ):
-            return href
-
-    return None
-
-
-def extract_field_from_text(
-    body_text: str,
-    labels: list[str],
-) -> str | None:
-    """
-    Procura um campo no texto renderizado da página.
-
-    Evita correspondências parciais como:
-        "Ano" -> "Ano da publicação"
-
-    exigindo o nome completo do rótulo.
-    """
+    body_text = (
+        page.locator("body")
+        .inner_text()
+    )
 
     lines = [
         normalize_space(line)
@@ -196,14 +92,71 @@ def extract_field_from_text(
         if line
     ]
 
-    for index, line in enumerate(lines):
-        for label in labels:
-            label_pattern = re.escape(label)
+    start_index = None
+    end_index = None
 
-            # Caso:
-            # Ano da publicação: 1983
+    for index, line in enumerate(lines):
+        if (
+            line.lower()
+            == "detalhes bibliográficos"
+        ):
+            start_index = index + 1
+            break
+
+    if start_index is None:
+        return []
+
+    for index in range(
+        start_index,
+        len(lines),
+    ):
+        if (
+            lines[index].lower()
+            == "metadados do item"
+        ):
+            end_index = index
+            break
+
+    if end_index is None:
+        end_index = len(lines)
+
+    return lines[
+        start_index:end_index
+    ]
+
+
+def extract_field(
+    lines: list[str],
+    labels: list[str],
+) -> str | None:
+    """
+    Extrai um campo da seção bibliográfica.
+
+    Suporta dois formatos encontrados na BDTD:
+
+    1.
+        Ano de defesa:1983
+
+    2.
+        Autor(a) principal:
+        Cleve, Clemerson Merlin
+    """
+
+    for index, line in enumerate(lines):
+
+        for label in labels:
+
+            # -----------------------------
+            # Formato:
+            # Tipo de documento:Dissertação
+            # -----------------------------
+            pattern = (
+                rf"^{re.escape(label)}"
+                rf"\s*:\s*(.+)$"
+            )
+
             match = re.match(
-                rf"^{label_pattern}\s*:\s*(.+)$",
+                pattern,
                 line,
                 flags=re.IGNORECASE,
             )
@@ -213,11 +166,18 @@ def extract_field_from_text(
                     match.group(1)
                 )
 
-            # Caso:
-            # Ano da publicação
-            # 1983
-            if re.fullmatch(
-                rf"{label_pattern}\s*:?",
+            # -----------------------------
+            # Formato:
+            # Autor(a) principal:
+            # Nome do autor
+            # -----------------------------
+            label_only_pattern = (
+                rf"^{re.escape(label)}"
+                rf"\s*:\s*$"
+            )
+
+            if re.match(
+                label_only_pattern,
                 line,
                 flags=re.IGNORECASE,
             ):
@@ -229,12 +189,40 @@ def extract_field_from_text(
     return None
 
 
-def extract_abstract(
-    body_text: str,
+def extract_title(
+    page,
 ) -> str | None:
     """
-    Extrai o resumo sem confundir com elementos da interface.
+    Extrai o título principal do registro.
     """
+
+    # Tenta títulos estruturados primeiro.
+    selectors = [
+        "h1",
+        ".record-title",
+        ".title",
+    ]
+
+    for selector in selectors:
+        locator = page.locator(
+            selector
+        )
+
+        if locator.count() == 0:
+            continue
+
+        text = normalize_space(
+            locator.first.inner_text()
+        )
+
+        if text:
+            return text
+
+    # Fallback baseado na estrutura textual.
+    body_text = (
+        page.locator("body")
+        .inner_text()
+    )
 
     lines = [
         normalize_space(line)
@@ -247,61 +235,15 @@ def extract_abstract(
         if line
     ]
 
-    start_labels = {
-        "resumo",
-        "resumo em português",
-    }
-
-    stop_labels = {
-        "abstract",
-        "assunto",
-        "palavras-chave",
-        "autor",
-        "autor(a)",
-        "orientador",
-        "orientador(a)",
-        "tipo de documento",
-        "ano da publicação",
-        "idioma",
-        "instituição",
-        "programa de pós-graduação",
-        "departamento",
-        "país",
-        "acesso ao documento",
-    }
-
     for index, line in enumerate(lines):
-        normalized = (
+        if (
             line.lower()
-            .rstrip(":")
-            .strip()
-        )
-
-        if normalized not in start_labels:
-            continue
-
-        collected = []
-
-        for next_line in lines[
-            index + 1 :
-        ]:
-            normalized_next = (
-                next_line.lower()
-                .rstrip(":")
-                .strip()
-            )
-
-            if normalized_next in stop_labels:
-                break
-
-            collected.append(next_line)
-
-        abstract = normalize_space(
-            " ".join(collected)
-        )
-
-        if abstract:
-            return abstract
+            == "detalhes bibliográficos"
+            and index > 0
+        ):
+            return lines[
+                index - 1
+            ]
 
     return None
 
@@ -311,12 +253,15 @@ def extract_metadata_from_page(
     record_url: str,
 ) -> dict:
     """
-    Extrai os principais metadados do registro.
+    Extrai os principais metadados bibliográficos
+    do registro atual da BDTD.
     """
 
-    body_text = page.locator(
-        "body"
-    ).inner_text()
+    bibliographic_lines = (
+        get_bibliographic_lines(
+            page
+        )
+    )
 
     record_id = extract_record_id(
         record_url
@@ -324,79 +269,103 @@ def extract_metadata_from_page(
 
     metadata = {
         "record_id": record_id,
+
         "source": "BDTD",
+
         "record_url": record_url,
-        "title": extract_title(page),
-        "year": extract_field_from_text(
-            body_text,
+
+        "title": extract_title(
+            page
+        ),
+
+        "year": extract_field(
+            bibliographic_lines,
             [
-                "Ano da publicação",
+                "Ano de defesa",
                 "Ano de publicação",
             ],
         ),
-        "author": extract_field_from_text(
-            body_text,
+
+        "author": extract_field(
+            bibliographic_lines,
             [
-                "Autor",
+                "Autor(a) principal",
+                "Autor principal",
                 "Autor(a)",
+                "Autor",
             ],
         ),
-        "advisor": extract_field_from_text(
-            body_text,
+
+        "advisor": extract_field(
+            bibliographic_lines,
             [
-                "Orientador",
                 "Orientador(a)",
+                "Orientador",
             ],
         ),
-        "document_type": extract_field_from_text(
-            body_text,
+
+        "document_type": extract_field(
+            bibliographic_lines,
             [
                 "Tipo de documento",
             ],
         ),
-        "access_type": extract_field_from_text(
-            body_text,
+
+        "access_type": extract_field(
+            bibliographic_lines,
             [
                 "Tipo de acesso",
-                "Tipo de Acesso",
             ],
         ),
-        "language": extract_field_from_text(
-            body_text,
+
+        "language": extract_field(
+            bibliographic_lines,
             [
                 "Idioma",
             ],
         ),
-        "institution": extract_field_from_text(
-            body_text,
+
+        "institution": extract_field(
+            bibliographic_lines,
             [
                 "Instituição de defesa",
                 "Instituição",
             ],
         ),
-        "graduate_program": extract_field_from_text(
-            body_text,
+
+        "graduate_program": extract_field(
+            bibliographic_lines,
             [
                 "Programa de Pós-Graduação",
             ],
         ),
-        "department": extract_field_from_text(
-            body_text,
+
+        "department": extract_field(
+            bibliographic_lines,
             [
                 "Departamento",
             ],
         ),
-        "country": extract_field_from_text(
-            body_text,
+
+        "country": extract_field(
+            bibliographic_lines,
             [
                 "País",
             ],
         ),
-        "access_url": extract_access_url(
-            page
+
+        "access_url": extract_field(
+            bibliographic_lines,
+            [
+                "Link de acesso",
+            ],
         ),
-        "abstract": extract_abstract(
-            body_text
+
+        "abstract": extract_field(
+            bibliographic_lines,
+            [
+                "Resumo",
+            ],
         ),
     }
 
@@ -405,12 +374,16 @@ def extract_metadata_from_page(
 
 def load_record_urls() -> list[str]:
     """
-    Lê record_urls.json.
+    Carrega as URLs coletadas pela etapa search_records.
 
-    Aceita tanto o formato atual:
-        {"record_urls": [...]}
+    Aceita:
 
-    quanto uma lista antiga:
+    Formato atual:
+        {
+            "record_urls": [...]
+        }
+
+    Formato antigo:
         [...]
     """
 
@@ -427,17 +400,26 @@ def load_record_urls() -> list[str]:
     ) as file:
         data = json.load(file)
 
-    if isinstance(data, list):
+    if isinstance(
+        data,
+        list,
+    ):
         return data
 
-    if isinstance(data, dict):
-        urls = data.get(
+    if isinstance(
+        data,
+        dict,
+    ):
+        record_urls = data.get(
             "record_urls",
             [],
         )
 
-        if isinstance(urls, list):
-            return urls
+        if isinstance(
+            record_urls,
+            list,
+        ):
+            return record_urls
 
     raise ValueError(
         "Formato inválido em "
@@ -449,7 +431,7 @@ def save_metadata(
     metadata: dict,
 ) -> Path:
     """
-    Salva um registro individual em JSON.
+    Salva o metadata individual do registro.
     """
 
     record_id = metadata[
@@ -477,6 +459,11 @@ def save_metadata(
 
 
 def run() -> None:
+    """
+    Executa a extração dos metadados de todos os
+    registros coletados anteriormente.
+    """
+
     create_directories()
 
     record_urls = load_record_urls()
@@ -490,8 +477,11 @@ def run() -> None:
     errors = 0
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
-            headless=BDTD_HEADLESS,
+
+        browser = (
+            playwright.chromium.launch(
+                headless=BDTD_HEADLESS,
+            )
         )
 
         context = browser.new_context(
@@ -511,15 +501,19 @@ def run() -> None:
             print("=" * 60)
 
             print(
-                f"[{index}/{len(record_urls)}]"
+                f"[{index}/"
+                f"{len(record_urls)}]"
             )
 
             print(record_url)
 
             try:
+
                 page.goto(
                     record_url,
-                    wait_until="domcontentloaded",
+                    wait_until=(
+                        "domcontentloaded"
+                    ),
                     timeout=60000,
                 )
 
@@ -534,8 +528,10 @@ def run() -> None:
                     )
                 )
 
-                output_file = save_metadata(
-                    metadata
+                output_file = (
+                    save_metadata(
+                        metadata
+                    )
                 )
 
                 success += 1
@@ -548,7 +544,21 @@ def run() -> None:
                 )
 
                 print(
-                    "Acesso:",
+                    "Ano:",
+                    metadata.get(
+                        "year"
+                    ),
+                )
+
+                print(
+                    "Autor:",
+                    metadata.get(
+                        "author"
+                    ),
+                )
+
+                print(
+                    "URL:",
                     metadata.get(
                         "access_url"
                     ),
@@ -560,6 +570,7 @@ def run() -> None:
                 )
 
             except Exception as error:
+
                 errors += 1
 
                 print(
@@ -572,9 +583,17 @@ def run() -> None:
 
     print()
     print("=" * 60)
-    print("EXTRAÇÃO FINALIZADA")
-    print("Sucesso:", success)
-    print("Erros:", errors)
+    print(
+        "EXTRAÇÃO FINALIZADA"
+    )
+    print(
+        "Sucesso:",
+        success,
+    )
+    print(
+        "Erros:",
+        errors,
+    )
 
 
 if __name__ == "__main__":
