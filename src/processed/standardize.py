@@ -12,14 +12,21 @@ Responsabilidades:
 - unir metadados da BDTD ao texto extraído dos PDFs;
 - garantir um esquema uniforme;
 - preservar a divisão por páginas;
+- aplicar padronização textual:
+    * Unicode NFC;
+    * remoção de caracteres de controle;
+    * limpeza de espaços e tabulações;
+    * normalização de quebras de linha;
 - identificar documentos sem texto utilizável.
 
-Esta etapa NÃO altera linguisticamente o texto.
-A normalização é realizada em normalize.py.
+Esta etapa NÃO realiza lematização.
+A normalização linguística será feita posteriormente.
 """
 
 import json
 import logging
+import re
+import unicodedata
 
 from src.config import (
     METADATA_DIR,
@@ -50,7 +57,6 @@ def load_json(path):
     """
     Carrega um arquivo JSON.
     """
-
     with open(
         path,
         "r",
@@ -63,7 +69,6 @@ def save_json(path, data):
     """
     Salva dados em JSON UTF-8.
     """
-
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -83,17 +88,16 @@ def save_json(path, data):
 
 
 # ============================================================
-# UTILITÁRIOS
+# METADADOS
 # ============================================================
 
 
 def normalize_metadata_value(value):
     """
-    Padroniza valores de metadados sem alterar
-    semanticamente seu conteúdo.
+    Padroniza valores simples de metadados.
 
-    - None vira null no JSON;
-    - strings vazias viram null;
+    - None permanece None;
+    - strings vazias viram None;
     - espaços externos são removidos.
     """
 
@@ -109,27 +113,128 @@ def normalize_metadata_value(value):
     return value
 
 
-def count_characters(pages):
+# ============================================================
+# PADRONIZAÇÃO TEXTUAL
+# ============================================================
+
+
+def standardize_text(text):
     """
-    Conta a quantidade total de caracteres
-    extraídos do documento.
+    Aplica padronização textual de acordo com
+    as regras utilizadas na etapa Processed.
+
+    Regras:
+    1. Unicode NFC;
+    2. remoção de caracteres de controle;
+    3. limpeza de espaços e tabs;
+    4. normalização de quebras de linha.
     """
 
-    return sum(
-        len(page.get("text", ""))
-        for page in pages
+    if not text:
+        return ""
+
+    # --------------------------------------------------------
+    # 1. Unicode NFC
+    # --------------------------------------------------------
+
+    text = unicodedata.normalize(
+        "NFC",
+        text,
     )
+
+    # --------------------------------------------------------
+    # 2. Padroniza diferentes quebras de linha
+    # --------------------------------------------------------
+
+    text = text.replace(
+        "\r\n",
+        "\n",
+    )
+
+    text = text.replace(
+        "\r",
+        "\n",
+    )
+
+    # --------------------------------------------------------
+    # 3. Remove caracteres de controle
+    #
+    # Mantemos:
+    # \n -> quebra de linha
+    # \t -> tratado posteriormente
+    # --------------------------------------------------------
+
+    text = re.sub(
+        r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]",
+        "",
+        text,
+    )
+
+    # --------------------------------------------------------
+    # 4. Tabs -> espaço
+    # --------------------------------------------------------
+
+    text = text.replace(
+        "\t",
+        " ",
+    )
+
+    # --------------------------------------------------------
+    # 5. Remove espaços repetidos
+    #
+    # Não inclui \n, para preservar a estrutura
+    # de parágrafos.
+    # --------------------------------------------------------
+
+    text = re.sub(
+        r" {2,}",
+        " ",
+        text,
+    )
+
+    # --------------------------------------------------------
+    # 6. Remove espaços no início/fim de cada linha
+    # --------------------------------------------------------
+
+    lines = [
+        line.strip()
+        for line in text.split("\n")
+    ]
+
+    text = "\n".join(lines)
+
+    # --------------------------------------------------------
+    # 7. Quebras excessivas
+    #
+    # Três ou mais quebras consecutivas viram duas.
+    # Assim preservamos separação de parágrafos.
+    # --------------------------------------------------------
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text,
+    )
+
+    return text.strip()
+
+
+# ============================================================
+# PÁGINAS
+# ============================================================
 
 
 def standardize_pages(pages):
     """
-    Garante que todas as páginas tenham
-    a mesma estrutura.
-
-    O texto ainda não é normalizado.
+    Padroniza a estrutura e o texto de cada página.
     """
 
     standardized_pages = []
+
+    changed_pages = 0
+
+    original_characters = 0
+    standardized_characters = 0
 
     for index, page in enumerate(
         pages,
@@ -140,26 +245,61 @@ def standardize_pages(pages):
             index,
         )
 
-        text = page.get(
-            "text",
-            "",
+        original_text = (
+            page.get(
+                "text",
+                "",
+            )
+            or ""
         )
 
-        if text is None:
-            text = ""
+        standardized_text = (
+            standardize_text(
+                original_text
+            )
+        )
+
+        original_characters += len(
+            original_text
+        )
+
+        standardized_characters += len(
+            standardized_text
+        )
+
+        if (
+            original_text
+            != standardized_text
+        ):
+            changed_pages += 1
 
         standardized_pages.append(
             {
                 "page": page_number,
-                "text": str(text),
+                "text": standardized_text,
             }
         )
 
-    return standardized_pages
+    stats = {
+        "changed_pages": (
+            changed_pages
+        ),
+        "original_characters": (
+            original_characters
+        ),
+        "standardized_characters": (
+            standardized_characters
+        ),
+    }
+
+    return (
+        standardized_pages,
+        stats,
+    )
 
 
 # ============================================================
-# PADRONIZAÇÃO
+# DOCUMENTO
 # ============================================================
 
 
@@ -169,22 +309,26 @@ def standardize_document(
 ):
     """
     Une Staging e Raw Metadata em um único
-    esquema padronizado.
+    documento padronizado.
     """
 
     record_id = staging_data[
         "record_id"
     ]
 
-    pages = standardize_pages(
-        staging_data.get(
-            "pages",
-            [],
+    pages, stats = (
+        standardize_pages(
+            staging_data.get(
+                "pages",
+                [],
+            )
         )
     )
 
     total_characters = (
-        count_characters(pages)
+        stats[
+            "standardized_characters"
+        ]
     )
 
     document = {
@@ -202,62 +346,100 @@ def standardize_document(
             "title": normalize_metadata_value(
                 metadata.get("title")
             ),
+
             "year": normalize_metadata_value(
                 metadata.get("year")
             ),
+
             "author": normalize_metadata_value(
                 metadata.get("author")
             ),
+
             "advisor": normalize_metadata_value(
                 metadata.get("advisor")
             ),
+
             "document_type": normalize_metadata_value(
                 metadata.get(
                     "document_type"
                 )
             ),
+
             "access_type": normalize_metadata_value(
                 metadata.get(
                     "access_type"
                 )
             ),
+
             "language": normalize_metadata_value(
                 metadata.get("language")
             ),
+
             "institution": normalize_metadata_value(
                 metadata.get(
                     "institution"
                 )
             ),
+
             "graduate_program": normalize_metadata_value(
                 metadata.get(
                     "graduate_program"
                 )
             ),
+
             "department": normalize_metadata_value(
                 metadata.get(
                     "department"
                 )
             ),
+
             "country": normalize_metadata_value(
                 metadata.get("country")
             ),
+
             "access_url": normalize_metadata_value(
                 metadata.get(
                     "access_url"
                 )
             ),
+
             "abstract": normalize_metadata_value(
                 metadata.get("abstract")
             ),
         },
 
         "document": {
-            "total_pages": len(pages),
+            "total_pages": len(
+                pages
+            ),
+
             "total_characters": (
                 total_characters
             ),
+
             "pages": pages,
+        },
+
+        "standardization": {
+            "unicode_form": "NFC",
+
+            "changed_pages": (
+                stats[
+                    "changed_pages"
+                ]
+            ),
+
+            "original_characters": (
+                stats[
+                    "original_characters"
+                ]
+            ),
+
+            "standardized_characters": (
+                stats[
+                    "standardized_characters"
+                ]
+            ),
         },
 
         "quality": {
@@ -277,14 +459,16 @@ def standardize_document(
 
 def run():
     """
-    Executa a padronização de todos os documentos
-    presentes na camada Staging.
+    Executa a padronização dos documentos da
+    camada Staging.
     """
 
     create_directories()
 
     staging_files = sorted(
-        STAGING_DIR.glob("*.json")
+        STAGING_DIR.glob(
+            "*.json"
+        )
     )
 
     logger.info(
@@ -297,11 +481,17 @@ def run():
     missing_metadata = 0
     errors = 0
 
+    total_changed_pages = 0
+    total_original_characters = 0
+    total_standardized_characters = 0
+
     for index, staging_file in enumerate(
         staging_files,
         start=1,
     ):
-        record_id = staging_file.stem
+        record_id = (
+            staging_file.stem
+        )
 
         logger.info(
             "[%d/%d] Padronizando %s",
@@ -325,12 +515,16 @@ def run():
             continue
 
         try:
-            staging_data = load_json(
-                staging_file
+            staging_data = (
+                load_json(
+                    staging_file
+                )
             )
 
-            metadata = load_json(
-                metadata_file
+            metadata = (
+                load_json(
+                    metadata_file
+                )
             )
 
             document = (
@@ -347,6 +541,7 @@ def run():
             if not document[
                 "quality"
             ]["has_text"]:
+
                 logger.warning(
                     "%s não possui texto extraído.",
                     record_id,
@@ -369,17 +564,47 @@ def run():
                 document,
             )
 
+            stats = (
+                document[
+                    "standardization"
+                ]
+            )
+
+            total_changed_pages += (
+                stats[
+                    "changed_pages"
+                ]
+            )
+
+            total_original_characters += (
+                stats[
+                    "original_characters"
+                ]
+            )
+
+            total_standardized_characters += (
+                stats[
+                    "standardized_characters"
+                ]
+            )
+
             success += 1
 
             logger.info(
-                "Salvo: %s | páginas=%d | caracteres=%d",
+                "Salvo: %s | páginas=%d | alteradas=%d | caracteres=%d -> %d",
                 output_file,
                 document[
                     "document"
                 ]["total_pages"],
-                document[
-                    "document"
-                ]["total_characters"],
+                stats[
+                    "changed_pages"
+                ],
+                stats[
+                    "original_characters"
+                ],
+                stats[
+                    "standardized_characters"
+                ],
             )
 
         except Exception as error:
@@ -391,22 +616,44 @@ def run():
                 error,
             )
 
-    logger.info("=" * 60)
+    logger.info(
+        "=" * 60
+    )
+
     logger.info(
         "PADRONIZAÇÃO FINALIZADA"
     )
+
     logger.info(
         "Padronizados: %d",
         success,
     )
+
     logger.info(
         "Sem texto: %d",
         skipped_no_text,
     )
+
     logger.info(
         "Metadata ausente: %d",
         missing_metadata,
     )
+
+    logger.info(
+        "Páginas alteradas: %d",
+        total_changed_pages,
+    )
+
+    logger.info(
+        "Caracteres antes: %d",
+        total_original_characters,
+    )
+
+    logger.info(
+        "Caracteres depois: %d",
+        total_standardized_characters,
+    )
+
     logger.info(
         "Erros: %d",
         errors,
