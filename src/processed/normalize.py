@@ -9,8 +9,9 @@ Saída:
 
 Responsabilidades:
 - aplicar lematização com spaCy;
-- reduzir palavras às suas formas canônicas;
-- preservar pontuação, números e espaços;
+- reduzir palavras às formas canônicas;
+- preservar tokens em caixa alta;
+- preservar siglas, números e tokens especiais;
 - manter a estrutura por páginas;
 - registrar estatísticas da normalização.
 
@@ -19,6 +20,7 @@ Esta etapa NÃO realiza deduplicação.
 
 import json
 import logging
+import re
 
 import spacy
 
@@ -51,10 +53,6 @@ MODEL_NAME = "pt_core_news_sm"
 def load_nlp():
     """
     Carrega o modelo de português do spaCy.
-
-    NER e parser são desativados porque não são
-    necessários para a lematização e aumentariam
-    o custo de processamento.
     """
 
     try:
@@ -66,8 +64,6 @@ def load_nlp():
             ],
         )
 
-        # Teses e dissertações podem conter páginas longas.
-        # Aumentamos o limite padrão do spaCy.
         nlp.max_length = 2_000_000
 
         return nlp
@@ -113,21 +109,66 @@ def save_json(path, data):
 
 
 # ============================================================
+# REGRAS DE PRESERVAÇÃO
+# ============================================================
+
+
+def should_preserve_token(token):
+    """
+    Define tokens que não devem ser lematizados.
+
+    Preserva:
+    - espaços;
+    - pontuação;
+    - números;
+    - URLs;
+    - e-mails;
+    - tokens totalmente em maiúsculas;
+    - siglas;
+    - tokens que não possuem caracteres alfabéticos.
+    """
+
+    if token.is_space:
+        return True
+
+    if token.is_punct:
+        return True
+
+    if token.like_num:
+        return True
+
+    if token.like_url:
+        return True
+
+    if token.like_email:
+        return True
+
+    text = token.text
+
+    # Preserva tokens sem letras
+    if not re.search(r"[A-Za-zÀ-ÿ]", text):
+        return True
+
+    # Preserva palavras totalmente em caixa alta
+    # Ex.: STF, STJ, CONCURSO, DIREITOS
+    if text.isupper():
+        return True
+
+    return False
+
+
+# ============================================================
 # NORMALIZAÇÃO
 # ============================================================
 
 
 def lemmatize_text(text, nlp):
     """
-    Aplica lematização ao texto.
+    Aplica lematização conservadora.
 
-    Preserva:
-    - pontuação;
-    - números;
-    - espaços;
-    - quebras de linha.
-
-    Para tokens sem lema válido, mantém o texto original.
+    Preserva elementos que podem ser prejudicados pela
+    lematização automática, especialmente títulos,
+    siglas e elementos jurídicos em caixa alta.
     """
 
     if not text:
@@ -138,22 +179,27 @@ def lemmatize_text(text, nlp):
     parts = []
 
     for token in doc:
-        # Espaços/quebras são preservados diretamente.
         if token.is_space:
             parts.append(token.text)
             continue
 
-        lemma = token.lemma_
+        if should_preserve_token(token):
+            normalized_token = token.text
 
-        # Fallback seguro.
-        if (
-            not lemma
-            or lemma == "-PRON-"
-        ):
-            lemma = token.text
+        else:
+            lemma = token.lemma_
+
+            if (
+                not lemma
+                or lemma == "-PRON-"
+            ):
+                normalized_token = token.text
+            else:
+                normalized_token = lemma
 
         parts.append(
-            lemma + token.whitespace_
+            normalized_token
+            + token.whitespace_
         )
 
     return "".join(parts)
@@ -182,7 +228,10 @@ def normalize_document(data, nlp):
 
     for page in pages:
         original_text = (
-            page.get("text", "")
+            page.get(
+                "text",
+                "",
+            )
             or ""
         )
 
@@ -235,9 +284,13 @@ def normalize_document(data, nlp):
     normalized_data[
         "normalization"
     ] = {
-        "method": "lemmatization",
+        "method": "conservative_lemmatization",
         "library": "spaCy",
         "model": MODEL_NAME,
+        "preserve_uppercase": True,
+        "preserve_numbers": True,
+        "preserve_punctuation": True,
+        "preserve_urls": True,
         "changed_pages": (
             changed_pages
         ),
