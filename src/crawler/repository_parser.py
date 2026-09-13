@@ -3,14 +3,13 @@ Descoberta e download de PDFs nos repositórios institucionais.
 
 Responsabilidades:
 - abrir páginas dos repositórios;
+- resolver URLs Handle quando possível;
 - consultar DSpace moderno;
-- identificar links de download;
-- reconhecer botões como "Baixar/Abrir";
-- priorizar bitstreams e PDFs;
-- tentar download via requests;
-- usar o contexto do navegador como fallback.
+- descobrir links candidatos;
+- priorizar links de download;
+- tentar baixar o PDF encontrado.
 
-Não percorre registros da BDTD.
+Não percorre os registros da BDTD.
 Essa responsabilidade pertence ao downloader.py.
 """
 
@@ -52,6 +51,177 @@ MAX_CANDIDATES = 20
 
 
 # ============================================================
+# RESOLUÇÃO DE HANDLE
+# ============================================================
+
+def resolve_handle_urls(
+    repository_url,
+):
+    """
+    Gera possíveis URLs alternativas para identificadores Handle.
+
+    Exemplo:
+
+        http://hdl.handle.net/11612/7938
+
+    Pode resolver para o repositório institucional atual.
+
+    O endereço original nunca é descartado.
+    """
+
+    if not repository_url:
+        return []
+
+    repository_url = (
+        str(repository_url)
+        .strip()
+    )
+
+    urls = []
+
+    parsed = urlparse(
+        repository_url
+    )
+
+    host = (
+        parsed.netloc
+        .lower()
+    )
+
+    # --------------------------------------------------------
+    # NÃO É HANDLE
+    # --------------------------------------------------------
+
+    if (
+        "hdl.handle.net"
+        not in host
+    ):
+        return [
+            repository_url
+        ]
+
+    print(
+        "Identificador Handle detectado:"
+    )
+
+    print(
+        repository_url
+    )
+
+    # --------------------------------------------------------
+    # 1. TENTA RESOLVER PELO SERVIÇO HANDLE
+    # --------------------------------------------------------
+
+    try:
+        response = requests.get(
+            repository_url,
+            headers=HEADERS,
+            timeout=REQUEST_TIMEOUT,
+            verify=False,
+            allow_redirects=True,
+        )
+
+        final_url = (
+            response.url
+            if response.url
+            else None
+        )
+
+        if final_url:
+
+            final_host = (
+                urlparse(
+                    final_url
+                )
+                .netloc
+                .lower()
+            )
+
+            if (
+                "hdl.handle.net"
+                not in final_host
+            ):
+
+                print(
+                    "Handle resolvido para:"
+                )
+
+                print(
+                    final_url
+                )
+
+                urls.append(
+                    final_url
+                )
+
+    except Exception as error:
+
+        print(
+            "Falha ao resolver Handle:"
+        )
+
+        print(
+            error
+        )
+
+    # --------------------------------------------------------
+    # 2. FALLBACK UFT
+    #
+    # prefixo Handle:
+    #
+    #     11612
+    #
+    # exemplo:
+    #
+    # http://hdl.handle.net/11612/7938
+    #
+    # ->
+    #
+    # https://umbu.uft.edu.br/handle/11612/7938
+    # --------------------------------------------------------
+
+    handle_path = (
+        parsed.path
+        .strip("/")
+    )
+
+    if handle_path.startswith(
+        "11612/"
+    ):
+
+        fallback_uft = (
+            "https://umbu.uft.edu.br/"
+            f"handle/{handle_path}"
+        )
+
+        if fallback_uft not in urls:
+
+            print(
+                "Fallback UFT:"
+            )
+
+            print(
+                fallback_uft
+            )
+
+            urls.append(
+                fallback_uft
+            )
+
+    # --------------------------------------------------------
+    # 3. URL ORIGINAL
+    # --------------------------------------------------------
+
+    if repository_url not in urls:
+
+        urls.append(
+            repository_url
+        )
+
+    return urls
+
+
+# ============================================================
 # DSPACE MODERNO
 # ============================================================
 
@@ -60,10 +230,10 @@ def try_dspace_item_api(
     output_file,
 ):
     """
-    Tenta localizar um PDF pela API REST
+    Tenta localizar um PDF utilizando a API REST
     do DSpace 7+.
 
-    Aplicável principalmente a URLs:
+    É aplicável a URLs no formato:
 
         /items/<uuid>
     """
@@ -75,12 +245,15 @@ def try_dspace_item_api(
     )
 
     if not match:
+
         return {
             "success": False,
             "reason": "not_dspace_item",
         }
 
-    item_uuid = match.group(1)
+    item_uuid = (
+        match.group(1)
+    )
 
     parsed = urlparse(
         repository_url
@@ -127,7 +300,9 @@ def try_dspace_item_api(
                 continue
 
             bundle_uuid = (
-                bundle.get("uuid")
+                bundle.get(
+                    "uuid"
+                )
             )
 
             if not bundle_uuid:
@@ -167,13 +342,13 @@ def try_dspace_item_api(
                     )
                 )
 
-                uuid = (
+                bitstream_uuid = (
                     bitstream.get(
                         "uuid"
                     )
                 )
 
-                if not uuid:
+                if not bitstream_uuid:
                     continue
 
                 if not filename.lower().endswith(
@@ -184,12 +359,14 @@ def try_dspace_item_api(
                 pdf_url = (
                     f"{base}"
                     f"/server/api/core/"
-                    f"bitstreams/{uuid}"
+                    f"bitstreams/"
+                    f"{bitstream_uuid}"
                     f"/content"
                 )
 
                 print(
-                    "DSpace API encontrou PDF:"
+                    "PDF encontrado pela "
+                    "API DSpace:"
                 )
 
                 print(
@@ -210,8 +387,11 @@ def try_dspace_item_api(
     except Exception as error:
 
         print(
-            "DSpace API falhou:",
-            error,
+            "DSpace API falhou:"
+        )
+
+        print(
+            error
         )
 
     return {
@@ -231,10 +411,8 @@ def extra_candidate_score(
     text="",
 ):
     """
-    Adiciona prioridade para padrões comuns
-    de páginas DSpace, TEDE e similares.
-
-    Isso complementa score_candidate().
+    Dá prioridade a padrões comuns de arquivos
+    em DSpace, TEDE e outros repositórios.
     """
 
     score = 0
@@ -245,14 +423,14 @@ def extra_candidate_score(
         .strip()
     )
 
-    normalized_text = (
+    lower_text = (
         str(text)
         .lower()
         .strip()
     )
 
     # --------------------------------------------------------
-    # Texto do botão/link
+    # TEXTO DO LINK/BOTÃO
     # --------------------------------------------------------
 
     download_markers = [
@@ -271,13 +449,13 @@ def extra_candidate_score(
     ]
 
     if any(
-        marker in normalized_text
+        marker in lower_text
         for marker in download_markers
     ):
         score += 120
 
     # --------------------------------------------------------
-    # URL
+    # PADRÕES DE URL
     # --------------------------------------------------------
 
     if "/bitstream/" in lower_url:
@@ -298,30 +476,19 @@ def extra_candidate_score(
     if ".pdf" in lower_url:
         score += 150
 
-    if lower_url.endswith(".pdf"):
-        score += 50
-
     return score
 
 
 # ============================================================
-# CANDIDATOS A PARTIR DOS LINKS
+# COLETA DE CANDIDATOS POR LINKS
 # ============================================================
 
 def collect_candidates_from_links(
     page,
 ):
     """
-    Procura URLs candidatas nos elementos renderizados
-    da página.
-
-    Reconhece:
-    - links normais;
-    - iframes;
-    - embeds;
-    - objects;
-    - source;
-    - botões/link com texto de download.
+    Procura URLs candidatas nos elementos
+    renderizados da página.
     """
 
     candidates = []
@@ -341,15 +508,21 @@ def collect_candidates_from_links(
         )
 
         try:
-            count = locator.count()
+            count = (
+                locator.count()
+            )
 
         except Exception:
             continue
 
-        for index in range(count):
+        for index in range(
+            count
+        ):
 
-            element = locator.nth(
-                index
+            element = (
+                locator.nth(
+                    index
+                )
             )
 
             try:
@@ -370,6 +543,7 @@ def collect_candidates_from_links(
                 .strip()
             )
 
+            # Ignora links que não levam a arquivo/página.
             if raw_url.startswith(
                 (
                     "javascript:",
@@ -386,13 +560,15 @@ def collect_candidates_from_links(
 
             try:
                 text = (
-                    element.inner_text()
+                    element
+                    .inner_text()
                     .strip()
                 )
 
             except Exception:
                 text = ""
 
+            # Pontuação já existente no projeto.
             try:
                 base_score = (
                     score_candidate(
@@ -404,6 +580,7 @@ def collect_candidates_from_links(
             except Exception:
                 base_score = 0
 
+            # Pontuação complementar.
             extra_score = (
                 extra_candidate_score(
                     url,
@@ -431,22 +608,24 @@ def collect_candidates_from_links(
 
 
 # ============================================================
-# CANDIDATOS A PARTIR DO HTML
+# COLETA DE CANDIDATOS PELO HTML
 # ============================================================
 
 def collect_candidates_from_html(
     page,
 ):
     """
-    Procura URLs diretamente no HTML.
+    Procura URLs candidatas diretamente
+    no HTML da página.
 
-    Útil para páginas em que o link do arquivo
-    aparece em scripts ou atributos não capturados
-    pelos seletores normais.
+    Isso ajuda quando o link do arquivo aparece
+    dentro de scripts ou atributos.
     """
 
     try:
-        html = page.content()
+        html = (
+            page.content()
+        )
 
     except Exception:
         return []
@@ -454,7 +633,9 @@ def collect_candidates_from_html(
     candidates = []
 
     patterns = [
-        # URL absoluta terminando em PDF
+        # ----------------------------------------------------
+        # PDF absoluto
+        # ----------------------------------------------------
         (
             r'https?://'
             r'[^"\'<>\s]+'
@@ -462,7 +643,9 @@ def collect_candidates_from_html(
             r'(?:\?[^"\'<>\s]*)?'
         ),
 
-        # URLs relativas/absolutas com bitstream
+        # ----------------------------------------------------
+        # Bitstream
+        # ----------------------------------------------------
         (
             r'["\']'
             r'([^"\']*/bitstream/'
@@ -470,7 +653,9 @@ def collect_candidates_from_html(
             r'["\']'
         ),
 
-        # DSpace bitstreams download
+        # ----------------------------------------------------
+        # Bitstreams / download
+        # ----------------------------------------------------
         (
             r'["\']'
             r'([^"\']*/bitstreams/'
@@ -479,15 +664,20 @@ def collect_candidates_from_html(
             r'["\']'
         ),
 
-        # API DSpace
+        # ----------------------------------------------------
+        # DSpace REST
+        # ----------------------------------------------------
         (
             r'["\']'
             r'([^"\']*/server/api/core/'
-            r'bitstreams/[^"\']+/content)'
+            r'bitstreams/'
+            r'[^"\']+/content)'
             r'["\']'
         ),
 
+        # ----------------------------------------------------
         # Retrieve
+        # ----------------------------------------------------
         (
             r'["\']'
             r'([^"\']*/retrieve/'
@@ -510,7 +700,9 @@ def collect_candidates_from_html(
                 match,
                 tuple,
             ):
-                match = match[0]
+                match = (
+                    match[0]
+                )
 
             url = urljoin(
                 page.url,
@@ -549,15 +741,17 @@ def collect_candidates_from_html(
 
 
 # ============================================================
-# ORDENAÇÃO DOS CANDIDATOS
+# FILTRAGEM E ORDENAÇÃO
 # ============================================================
 
 def find_pdf_candidates(
     page,
 ):
     """
-    Combina candidatos encontrados no DOM e no HTML,
-    remove duplicatas e ordena pela pontuação.
+    Combina candidatos encontrados no DOM
+    e no HTML.
+
+    Remove duplicatas e ordena por pontuação.
     """
 
     candidates = []
@@ -594,18 +788,26 @@ def find_pdf_candidates(
         if url in seen:
             continue
 
+        # ----------------------------------------------------
+        # VALIDAÇÃO NORMAL
+        # ----------------------------------------------------
+
         try:
-            is_valid = (
+            valid = (
                 valid_candidate_url(
                     url
                 )
             )
 
         except Exception:
-            # Links altamente característicos de arquivo
-            # ainda podem ser usados mesmo se a função
-            # genérica não os reconhecer.
-            is_valid = False
+            valid = False
+
+        # ----------------------------------------------------
+        # CANDIDATO FORTE
+        #
+        # Permite links como "Baixar/Abrir" mesmo que
+        # valid_candidate_url() não os reconheça.
+        # ----------------------------------------------------
 
         strong_candidate = (
             extra_candidate_score(
@@ -619,12 +821,14 @@ def find_pdf_candidates(
         )
 
         if (
-            not is_valid
+            not valid
             and not strong_candidate
         ):
             continue
 
-        seen.add(url)
+        seen.add(
+            url
+        )
 
         result.append(
             candidate
@@ -642,9 +846,9 @@ def open_repository(
     repository_url,
 ):
     """
-    Abre página de repositório utilizando Playwright.
+    Abre página do repositório utilizando Playwright.
 
-    Tenta novamente em falhas temporárias.
+    Faz várias tentativas antes de desistir.
     """
 
     for attempt in range(
@@ -656,7 +860,7 @@ def open_repository(
             print(
                 f"Abrindo repositório "
                 f"(tentativa {attempt}/"
-                f"{MAX_RETRIES})..."
+                f"{MAX_RETRIES})"
             )
 
             page.goto(
@@ -676,11 +880,17 @@ def open_repository(
         except Exception as error:
 
             print(
-                "Falha ao abrir:",
-                error,
+                "Falha ao abrir:"
             )
 
-            if attempt < MAX_RETRIES:
+            print(
+                error
+            )
+
+            if (
+                attempt
+                < MAX_RETRIES
+            ):
 
                 time.sleep(
                     RETRY_WAIT_SECONDS
@@ -700,10 +910,10 @@ def try_candidate_download(
     referer,
 ):
     """
-    Tenta baixar um candidato:
+    Tenta baixar um candidato usando:
 
     1. requests;
-    2. browser context.
+    2. contexto Playwright.
     """
 
     for url in alternative_urls(
@@ -719,7 +929,7 @@ def try_candidate_download(
         )
 
         # ----------------------------------------------------
-        # REQUESTS
+        # 1. REQUESTS
         # ----------------------------------------------------
 
         result = (
@@ -734,7 +944,7 @@ def try_candidate_download(
             return result
 
         # ----------------------------------------------------
-        # PLAYWRIGHT
+        # 2. PLAYWRIGHT
         # ----------------------------------------------------
 
         result = (
@@ -751,25 +961,31 @@ def try_candidate_download(
 
     return {
         "success": False,
-        "reason": "candidate_failed",
+        "reason": (
+            "candidate_failed"
+        ),
     }
 
 
 # ============================================================
-# PROCESSAMENTO PRINCIPAL
+# PROCESSA UMA PÁGINA DO REPOSITÓRIO
 # ============================================================
 
-def process_repository_url(
+def process_repository_page(
     page,
     context,
     repository_url,
     output_file,
 ):
     """
-    Processa uma URL externa fornecida pela BDTD
-    e tenta localizar o PDF correspondente.
+    Processa uma URL já resolvida.
 
-    Contrato utilizado pelo downloader.py.
+    Essa função:
+    - testa PDF direto;
+    - testa DSpace moderno;
+    - abre a página;
+    - procura candidatos;
+    - tenta baixar.
     """
 
     repository_url = (
@@ -822,30 +1038,34 @@ def process_repository_url(
         }
 
     # ========================================================
-    # 2. DSPACE MODERNO /items/<uuid>
+    # 2. DSPACE MODERNO
     # ========================================================
 
     if "/items/" in repository_url:
 
-        result = try_dspace_item_api(
-            repository_url,
-            output_file,
+        result = (
+            try_dspace_item_api(
+                repository_url,
+                output_file,
+            )
         )
 
         if result["success"]:
             return result
 
     # ========================================================
-    # 3. ABRE PÁGINA DO REPOSITÓRIO
+    # 3. ABRE REPOSITÓRIO
     # ========================================================
 
-    opened = open_repository(
-        page,
-        repository_url,
+    opened = (
+        open_repository(
+            page,
+            repository_url,
+        )
     )
 
     # --------------------------------------------------------
-    # Tenta HTTPS para links antigos HTTP
+    # Alguns repositórios antigos funcionam melhor em HTTPS.
     # --------------------------------------------------------
 
     if (
@@ -870,9 +1090,11 @@ def process_repository_url(
             https_url
         )
 
-        opened = open_repository(
-            page,
-            https_url,
+        opened = (
+            open_repository(
+                page,
+                https_url,
+            )
         )
 
         if opened:
@@ -901,8 +1123,10 @@ def process_repository_url(
     # 4. RESTRIÇÕES / ANTI-BOT
     # ========================================================
 
-    special = detect_special_page(
-        page
+    special = (
+        detect_special_page(
+            page
+        )
     )
 
     if special:
@@ -913,21 +1137,23 @@ def process_repository_url(
         }
 
     # ========================================================
-    # 5. REDIRECIONAMENTO PARA DSPACE MODERNO
+    # 5. DSPACE MODERNO APÓS REDIRECIONAMENTO
     # ========================================================
 
     if "/items/" in page.url:
 
-        result = try_dspace_item_api(
-            page.url,
-            output_file,
+        result = (
+            try_dspace_item_api(
+                page.url,
+                output_file,
+            )
         )
 
         if result["success"]:
             return result
 
     # ========================================================
-    # 6. PROCURA CANDIDATOS
+    # 6. CANDIDATOS
     # ========================================================
 
     candidates = (
@@ -941,41 +1167,43 @@ def process_repository_url(
         len(candidates),
     )
 
+    # --------------------------------------------------------
+    # Exibe os principais candidatos para diagnóstico.
+    # --------------------------------------------------------
+
     if candidates:
 
         print(
             "Principais candidatos:"
         )
 
-        for candidate in candidates[
-            :5
-        ]:
+        for candidate in (
+            candidates[:5]
+        ):
 
             print(
-                f"  score="
-                f"{candidate['score']}"
-                f" | "
+                "  "
+                f"score={candidate['score']}"
+                " | "
                 f"{candidate.get('text', '')}"
-                f" | "
+                " | "
                 f"{candidate['url']}"
             )
 
     # ========================================================
-    # 7. TENTA CADA CANDIDATO
+    # 7. DOWNLOAD
     # ========================================================
 
-    for candidate in candidates[
-        :MAX_CANDIDATES
-    ]:
-
-        pdf_url = (
-            candidate["url"]
-        )
+    for candidate in (
+        candidates[
+            :MAX_CANDIDATES
+        ]
+    ):
 
         result = (
             try_candidate_download(
                 context,
-                pdf_url,
+                candidate["url"],
                 output_file,
                 referer=page.url,
             )
@@ -986,5 +1214,128 @@ def process_repository_url(
 
     return {
         "success": False,
-        "reason": "pdf_not_found",
+        "reason": (
+            "pdf_not_found"
+        ),
+    }
+
+
+# ============================================================
+# FUNÇÃO PRINCIPAL USADA PELO DOWNLOADER
+# ============================================================
+
+def process_repository_url(
+    page,
+    context,
+    repository_url,
+    output_file,
+):
+    """
+    Processa uma URL externa fornecida pela BDTD.
+
+    Se for Handle:
+    - tenta resolver;
+    - tenta fallback conhecido;
+    - tenta URL original.
+
+    Depois procura o PDF correspondente.
+
+    Este é o contrato principal utilizado pelo
+    downloader.py.
+    """
+
+    repository_url = (
+        str(repository_url)
+        .strip()
+    )
+
+    print(
+        "URL recebida:"
+    )
+
+    print(
+        repository_url
+    )
+
+    # ========================================================
+    # RESOLVE POSSÍVEIS ALTERNATIVAS
+    # ========================================================
+
+    resolved_urls = (
+        resolve_handle_urls(
+            repository_url
+        )
+    )
+
+    print(
+        "URLs candidatas de repositório:",
+        len(resolved_urls),
+    )
+
+    for candidate_url in (
+        resolved_urls
+    ):
+
+        print()
+        print(
+            "-" * 60
+        )
+
+        print(
+            "Tentando repositório:"
+        )
+
+        print(
+            candidate_url
+        )
+
+        result = (
+            process_repository_page(
+                page,
+                context,
+                candidate_url,
+                output_file,
+            )
+        )
+
+        if result["success"]:
+
+            if (
+                "url"
+                not in result
+            ):
+                result["url"] = (
+                    candidate_url
+                )
+
+            return result
+
+        reason = (
+            result.get(
+                "reason",
+                "unknown",
+            )
+        )
+
+        print(
+            "Falha desta URL:",
+            reason
+        )
+
+        # ----------------------------------------------------
+        # Não tenta contornar restrições reais.
+        # ----------------------------------------------------
+
+        if reason in {
+            "restricted_or_embargo",
+            "anti_bot",
+        }:
+
+            return result
+
+    return {
+        "success": False,
+        "reason": (
+            "pdf_not_found"
+        ),
     }
