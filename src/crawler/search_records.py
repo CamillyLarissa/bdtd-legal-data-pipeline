@@ -48,9 +48,13 @@ def build_search_url(query: str, page_number: int) -> str:
         &page=1
     """
     params = {
-        "lookfor": query,
-        "type": "AllFields",
-        "page": page_number,
+    "lookfor": "",
+    "type": "AllFields",
+    "filter[]": (
+        'dc.subject.cnpq.fl_str_mv:'
+        '"CNPQ::CIENCIAS SOCIAIS APLICADAS::DIREITO"'
+    ),
+    "page": page_number,
     }
 
     return f"{SEARCH_URL}?{urlencode(params)}"
