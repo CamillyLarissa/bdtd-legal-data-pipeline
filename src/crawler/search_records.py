@@ -1,274 +1,650 @@
-"""
-Coleta URLs de registros da BDTD a partir da busca por uma área/termo.
-
-Esta etapa corresponde ao início da camada Raw do pipeline.
-
-Fluxo:
-    BDTD
-      ↓
-    página de resultados
-      ↓
-    URLs dos registros
-      ↓
-    data/raw/metadata/record_urls.json
-
-A busca padrão utilizada no projeto é:
-    lookfor=Direito
-    type=AllFields
-"""
-
 import json
-from datetime import datetime, timezone
+import os
+import random
+import time
 from pathlib import Path
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode
 
 from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-from src.config import (
-    BDTD_HEADLESS,
-    BDTD_MAX_RECORDS,
-    BDTD_QUERY,
-    RECORD_URLS_FILE,
-    create_directories,
+
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
+BASE_URL = "https://bdtd.ibict.br/vufind/Search/Results"
+
+DATA_DIR = Path(
+    os.getenv(
+        "BDTD_DATA_DIR",
+        "data"
+    )
+)
+
+MAX_RECORDS = int(
+    os.getenv(
+        "BDTD_MAX_RECORDS",
+        "200"
+    )
+)
+
+HEADLESS = (
+    os.getenv(
+        "BDTD_HEADLESS",
+        "true"
+    ).lower()
+    == "true"
+)
+
+METADATA_DIR = (
+    DATA_DIR
+    / "raw"
+    / "metadata"
+)
+
+RECORD_URLS_FILE = (
+    METADATA_DIR
+    / "record_urls.json"
+)
+
+# Quantas vezes tentar a mesma página
+MAX_RETRIES_PER_PAGE = 8
+
+# Espera base quando a BDTD recusar conexão
+RETRY_WAIT_SECONDS = 30
+
+# Pequena pausa entre páginas normais
+MIN_PAGE_DELAY = 1.5
+MAX_PAGE_DELAY = 3.0
+
+# Quantidade padrão de resultados por página
+RESULTS_PER_PAGE = 20
+
+
+# ============================================================
+# FILTRO OFICIAL DO CORPUS
+# ============================================================
+
+CNPQ_FILTER = (
+    'dc.subject.cnpq.fl_str_mv:'
+    '"CNPQ::CIENCIAS SOCIAIS APLICADAS::DIREITO"'
 )
 
 
-BASE_URL = "https://bdtd.ibict.br"
-SEARCH_URL = f"{BASE_URL}/vufind/Search/Results"
+# ============================================================
+# UTILIDADES
+# ============================================================
 
-
-def build_search_url(query: str, page_number: int) -> str:
-    """
-    Monta a URL de busca da BDTD.
-
-    Exemplo:
-    https://bdtd.ibict.br/vufind/Search/Results
-        ?lookfor=Direito
-        &type=AllFields
-        &page=1
-    """
-    params = {
-    "lookfor": "",
-    "type": "AllFields",
-    "filter[]": (
-        'dc.subject.cnpq.fl_str_mv:'
-        '"CNPQ::CIENCIAS SOCIAIS APLICADAS::DIREITO"'
-    ),
-    "page": page_number,
-    }
-
-    return f"{SEARCH_URL}?{urlencode(params)}"
-
-
-def extract_record_links(page) -> list[str]:
-    """
-    Extrai os links dos registros existentes na página atual.
-
-    Em vez de depender de classes CSS específicas da interface,
-    percorremos todos os links e selecionamos aqueles cujo href
-    contém '/vufind/Record/'.
-
-    Isso torna o crawler menos dependente da estrutura visual
-    da página da BDTD.
-    """
-    links = page.locator("a")
-
-    record_urls = []
-
-    for index in range(links.count()):
-        href = links.nth(index).get_attribute("href")
-
-        if not href:
-            continue
-
-        if "/vufind/Record/" not in href:
-            continue
-
-        absolute_url = urljoin(BASE_URL, href)
-
-        if absolute_url not in record_urls:
-            record_urls.append(absolute_url)
-
-    return record_urls
-
-
-def save_record_urls(
-    record_urls: list[str],
-    output_file: Path,
-) -> None:
-    """
-    Salva os registros coletados em JSON.
-    """
-    output_file.parent.mkdir(
+def create_directories():
+    METADATA_DIR.mkdir(
         parents=True,
-        exist_ok=True,
+        exist_ok=True
     )
 
-    data = {
-        "source": "BDTD",
-        "query": BDTD_QUERY,
-        "search_type": "AllFields",
-        "collected_at": datetime.now(
-            timezone.utc
-        ).isoformat(),
-        "total_collected": len(record_urls),
-        "record_urls": record_urls,
-    }
 
-    with open(
-        output_file,
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            data,
-            file,
-            ensure_ascii=False,
-            indent=2,
+def build_search_url(page_number):
+    """
+    Monta a URL da busca da BDTD usando
+    o filtro CNPq da área Direito.
+    """
+
+    params = [
+        ("lookfor", ""),
+        ("type", "AllFields"),
+        (
+            "filter[]",
+            CNPQ_FILTER
+        ),
+        (
+            "page",
+            page_number
+        ),
+    ]
+
+    return (
+        BASE_URL
+        + "?"
+        + urlencode(params)
+    )
+
+
+def extract_record_urls(page):
+    """
+    Extrai os links dos registros individuais
+    presentes na página de resultados.
+    """
+
+    urls = []
+
+    links = page.locator(
+        'a[href*="/vufind/Record/"]'
+    )
+
+    count = links.count()
+
+    for i in range(count):
+        try:
+            href = links.nth(i).get_attribute(
+                "href"
+            )
+
+            if not href:
+                continue
+
+            if href.startswith("/"):
+                href = (
+                    "https://bdtd.ibict.br"
+                    + href
+                )
+
+            if "/vufind/Record/" not in href:
+                continue
+
+            # Remove parâmetros extras da URL
+            href = href.split("?")[0]
+
+            urls.append(href)
+
+        except Exception:
+            continue
+
+    # Remove duplicatas preservando ordem
+    unique_urls = list(
+        dict.fromkeys(urls)
+    )
+
+    return unique_urls
+
+
+def load_existing_urls():
+    """
+    Carrega coleta anterior, caso exista.
+
+    Isso impede que uma falha momentânea
+    sobrescreva uma coleta válida.
+    """
+
+    if not RECORD_URLS_FILE.exists():
+        return []
+
+    try:
+        with RECORD_URLS_FILE.open(
+            "r",
+            encoding="utf-8"
+        ) as f:
+            data = json.load(f)
+
+        if isinstance(data, list):
+            return data
+
+        if isinstance(data, dict):
+            return data.get(
+                "record_urls",
+                []
+            )
+
+    except Exception as exc:
+        print(
+            f"Aviso: não foi possível "
+            f"carregar coleta anterior: {exc}"
         )
 
+    return []
 
-def run() -> None:
-    """
-    Executa a busca na BDTD até atingir BDTD_MAX_RECORDS.
 
-    O processo percorre as páginas de resultados e acumula
-    URLs únicas de registros.
+def save_urls(urls):
     """
+    Salva progresso incrementalmente.
+    """
+
+    payload = {
+        "area": "Direito",
+        "filtro": (
+            "CNPQ::CIENCIAS SOCIAIS "
+            "APLICADAS::DIREITO"
+        ),
+        "total": len(urls),
+        "record_urls": urls,
+    }
+
+    temp_file = (
+        RECORD_URLS_FILE
+        .with_suffix(".tmp")
+    )
+
+    with temp_file.open(
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(
+            payload,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    # Escrita atômica:
+    # só substitui o arquivo final
+    # depois que o JSON foi escrito.
+    temp_file.replace(
+        RECORD_URLS_FILE
+    )
+
+
+def wait_before_retry(attempt):
+    """
+    Espera progressivamente mais entre
+    as tentativas da mesma página.
+    """
+
+    wait_time = (
+        RETRY_WAIT_SECONDS
+        * attempt
+    )
+
+    # Limita a espera máxima
+    wait_time = min(
+        wait_time,
+        180
+    )
+
+    print(
+        f"Aguardando {wait_time}s "
+        "antes de tentar novamente..."
+    )
+
+    time.sleep(wait_time)
+
+
+# ============================================================
+# ABERTURA DA PÁGINA COM RETRY
+# ============================================================
+
+def open_page_with_retry(
+    page,
+    page_number
+):
+    """
+    Tenta abrir a mesma página várias vezes
+    antes de desistir.
+    """
+
+    url = build_search_url(
+        page_number
+    )
+
+    for attempt in range(
+        1,
+        MAX_RETRIES_PER_PAGE + 1
+    ):
+
+        print()
+        print(
+            f"Tentativa {attempt}/"
+            f"{MAX_RETRIES_PER_PAGE}"
+        )
+
+        try:
+            response = page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=60000
+            )
+
+            # Pequena espera para a página
+            # terminar de renderizar.
+            page.wait_for_timeout(
+                1500
+            )
+
+            title = page.title()
+
+            print(
+                f"Título: {title}"
+            )
+
+            # Se houve resposta HTTP,
+            # mostra o status.
+            if response is not None:
+                print(
+                    "HTTP:",
+                    response.status
+                )
+
+                # Erros temporários do servidor
+                if response.status in {
+                    429,
+                    500,
+                    502,
+                    503,
+                    504,
+                }:
+                    raise RuntimeError(
+                        f"HTTP {response.status}"
+                    )
+
+            # Verifica páginas de erro
+            body_text = (
+                page.locator("body")
+                .inner_text()
+                .lower()
+            )
+
+            error_markers = [
+                "cannot connect",
+                "connection refused",
+                "service unavailable",
+                "temporarily unavailable",
+                "bad gateway",
+                "gateway timeout",
+            ]
+
+            if any(
+                marker in body_text
+                for marker in error_markers
+            ):
+                raise RuntimeError(
+                    "Página de erro/indisponibilidade"
+                )
+
+            return True, url
+
+        except (
+            PlaywrightTimeoutError,
+            Exception
+        ) as exc:
+
+            print(
+                f"Erro ao abrir página "
+                f"{page_number}: {exc}"
+            )
+
+            if (
+                attempt
+                < MAX_RETRIES_PER_PAGE
+            ):
+                wait_before_retry(
+                    attempt
+                )
+
+    return False, url
+
+
+# ============================================================
+# BUSCA
+# ============================================================
+
+def main():
     create_directories()
 
-    print(f"Consulta: {BDTD_QUERY}")
-    print(f"Limite: {BDTD_MAX_RECORDS}")
-    print()
+    print(
+        "Consulta: Direito"
+    )
+    print(
+        f"Limite: {MAX_RECORDS}"
+    )
 
+    existing_urls = (
+        load_existing_urls()
+    )
+
+    # Começamos uma nova coleta,
+    # mas preservamos a antiga em memória.
     collected_urls = []
-    seen_urls = set()
+
+    seen = set()
 
     page_number = 1
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
-            headless=BDTD_HEADLESS,
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=HEADLESS
         )
 
         context = browser.new_context(
-            viewport={
-                "width": 1440,
-                "height": 900,
-            }
+            user_agent=(
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/152.0.0.0 "
+                "Safari/537.36"
+            )
         )
 
         page = context.new_page()
 
-        while len(collected_urls) < BDTD_MAX_RECORDS:
-            current_url = build_search_url(
-                BDTD_QUERY,
-                page_number,
-            )
-
-            print(f"Página {page_number}")
-            print(current_url)
-
-            try:
-                page.goto(
-                    current_url,
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-
-                # Dá tempo para os resultados terminarem de aparecer.
-                page.wait_for_timeout(3000)
-
-            except Exception as error:
+        try:
+            while (
+                len(collected_urls)
+                < MAX_RECORDS
+            ):
+                print()
                 print(
-                    f"Erro ao abrir página {page_number}: "
-                    f"{error}"
+                    "=" * 70
                 )
-                break
+                print(
+                    f"Página {page_number}"
+                )
 
-            print(
-                "Título:",
-                page.title(),
-            )
+                search_url = (
+                    build_search_url(
+                        page_number
+                    )
+                )
 
-            page_record_urls = extract_record_links(
-                page
-            )
+                print(
+                    search_url
+                )
 
-            print(
-                "Encontrados na página:",
-                len(page_record_urls),
-            )
+                success, _ = (
+                    open_page_with_retry(
+                        page,
+                        page_number
+                    )
+                )
 
-            new_records = 0
+                # ====================================================
+                # BDTD ficou indisponível
+                # ====================================================
 
-            for record_url in page_record_urls:
-                if record_url in seen_urls:
-                    continue
+                if not success:
+                    print()
+                    print(
+                        "BDTD indisponível após "
+                        "todas as tentativas."
+                    )
 
-                seen_urls.add(record_url)
-                collected_urls.append(record_url)
+                    print(
+                        "A coleta parcial será "
+                        "preservada."
+                    )
 
-                new_records += 1
-
-                if (
-                    len(collected_urls)
-                    >= BDTD_MAX_RECORDS
-                ):
                     break
 
-            print(
-                "Novos:",
-                new_records,
-            )
+                # ====================================================
+                # EXTRAI LINKS
+                # ====================================================
 
-            print(
-                "Total coletado:",
-                len(collected_urls),
-            )
+                page_urls = (
+                    extract_record_urls(
+                        page
+                    )
+                )
 
+                found_count = len(
+                    page_urls
+                )
+
+                print(
+                    "Encontrados na página:",
+                    found_count
+                )
+
+                # ====================================================
+                # SEM RESULTADOS
+                # ====================================================
+
+                if found_count == 0:
+                    print(
+                        "Nenhum registro encontrado."
+                    )
+
+                    print(
+                        "Fim dos resultados."
+                    )
+
+                    break
+
+                # ====================================================
+                # ADICIONA NOVOS
+                # ====================================================
+
+                new_count = 0
+
+                for url in page_urls:
+                    if url in seen:
+                        continue
+
+                    seen.add(url)
+
+                    collected_urls.append(
+                        url
+                    )
+
+                    new_count += 1
+
+                    if (
+                        len(collected_urls)
+                        >= MAX_RECORDS
+                    ):
+                        break
+
+                print(
+                    "Novos:",
+                    new_count
+                )
+
+                print(
+                    "Total coletado:",
+                    len(collected_urls)
+                )
+
+                # ====================================================
+                # SALVAMENTO INCREMENTAL
+                # ====================================================
+
+                if collected_urls:
+                    save_urls(
+                        collected_urls
+                    )
+
+                # ====================================================
+                # PROTEÇÃO CONTRA LOOP
+                # ====================================================
+
+                if new_count == 0:
+                    print(
+                        "Página sem novos registros."
+                    )
+
+                    print(
+                        "Interrompendo para evitar loop."
+                    )
+
+                    break
+
+                page_number += 1
+
+                time.sleep(
+                    random.uniform(
+                        MIN_PAGE_DELAY,
+                        MAX_PAGE_DELAY
+                    )
+                )
+
+        finally:
+            context.close()
+            browser.close()
+
+    # ============================================================
+    # FINALIZAÇÃO SEGURA
+    # ============================================================
+
+    if collected_urls:
+        save_urls(
+            collected_urls
+        )
+
+        final_urls = (
+            collected_urls
+        )
+
+    else:
+        # Se nenhuma página conseguiu ser
+        # coletada, preserva coleta anterior.
+        if existing_urls:
             print()
+            print(
+                "Nenhum registro novo foi "
+                "coletado."
+            )
 
-            if not page_record_urls:
-                print(
-                    "Nenhum registro encontrado "
-                    "na página."
-                )
-                break
+            print(
+                "Mantendo record_urls.json "
+                "anterior."
+            )
 
-            if new_records == 0:
-                print(
-                    "Nenhum registro novo encontrado. "
-                    "Encerrando para evitar loop."
-                )
-                break
+            final_urls = (
+                existing_urls
+            )
 
-            page_number += 1
-
-        context.close()
-        browser.close()
-
-    # Respeita exatamente o limite solicitado.
-    collected_urls = collected_urls[
-        :BDTD_MAX_RECORDS
-    ]
-
-    save_record_urls(
-        collected_urls,
-        RECORD_URLS_FILE,
-    )
+        else:
+            final_urls = []
 
     print()
-    print("Busca finalizada.")
+    print(
+        "=" * 70
+    )
+    print(
+        "BUSCA FINALIZADA"
+    )
+    print(
+        "=" * 70
+    )
+
     print(
         "Registros:",
-        len(collected_urls),
+        len(final_urls)
     )
+
     print(
         "Arquivo:",
-        RECORD_URLS_FILE,
+        RECORD_URLS_FILE
     )
 
+    if (
+        len(final_urls)
+        < MAX_RECORDS
+    ):
+        print()
+        print(
+            "AVISO: coleta incompleta."
+        )
+
+        print(
+            f"Obtidos: {len(final_urls)}"
+        )
+
+        print(
+            f"Meta: {MAX_RECORDS}"
+        )
+
+
+# ============================================================
+# EXECUÇÃO
+# ============================================================
 
 if __name__ == "__main__":
-    run()
+    main()
