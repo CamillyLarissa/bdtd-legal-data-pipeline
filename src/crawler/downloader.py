@@ -11,30 +11,34 @@ Manifestos:
     data/raw/manifests/download_manifest.json
     data/raw/manifests/failed_downloads.json
 
-Responsabilidades deste arquivo:
+Responsabilidades:
 - carregar os metadados;
 - percorrer os registros;
 - verificar PDFs existentes;
 - chamar repository_parser;
-- registrar sucesso e falha.
+- registrar sucessos e falhas.
 
-A lógica específica de descoberta dos PDFs não fica aqui.
+A descoberta específica dos PDFs pertence ao
+repository_parser.py.
 """
 
 import json
 import os
 import re
 import time
+from pathlib import Path
 
-from playwright.sync_api import (
-    sync_playwright,
-)
+from playwright.sync_api import sync_playwright
 
 from src.config import (
     MANIFEST_DIR,
     METADATA_DIR,
     PDF_DIR,
     create_directories,
+)
+
+from src.crawler.download_utils import (
+    content_is_pdf_bytes,
 )
 
 from src.crawler.repository_parser import (
@@ -53,7 +57,6 @@ MAX_RECORDS = int(
     )
 )
 
-
 HEADLESS = (
     os.getenv(
         "BDTD_HEADLESS",
@@ -67,40 +70,31 @@ HEADLESS = (
 # JSON
 # ============================================================
 
+def load_json(path: Path):
+    """Lê um arquivo JSON."""
 
-def load_json(path):
-    """
-    Lê um arquivo JSON.
-    """
-
-    with open(
-        path,
+    with path.open(
         "r",
         encoding="utf-8",
     ) as file:
-
         return json.load(file)
 
 
 def save_json(
-    path,
+    path: Path,
     data,
 ):
-    """
-    Salva um arquivo JSON.
-    """
+    """Salva dados em formato JSON."""
 
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    with open(
-        path,
+    with path.open(
         "w",
         encoding="utf-8",
     ) as file:
-
         json.dump(
             data,
             file,
@@ -109,16 +103,34 @@ def save_json(
         )
 
 
+def save_manifest(manifest):
+    """
+    Salva o manifesto incremental de downloads.
+
+    É utilizado durante a execução para evitar perda
+    das informações já processadas caso o crawler seja
+    interrompido.
+    """
+
+    save_json(
+        MANIFEST_DIR
+        / "download_manifest.json",
+        manifest,
+    )
+
+
+# ============================================================
+# METADADOS
+# ============================================================
+
 def load_metadata_files():
     """
-    Carrega os arquivos individuais de metadata,
-    respeitando BDTD_MAX_RECORDS.
+    Carrega os arquivos individuais de metadados,
+    respeitando o limite BDTD_MAX_RECORDS.
     """
 
     return sorted(
-        METADATA_DIR.glob(
-            "*.json"
-        )
+        METADATA_DIR.glob("*.json")
     )[:MAX_RECORDS]
 
 
@@ -126,22 +138,18 @@ def load_metadata_files():
 # URLs
 # ============================================================
 
-
 def split_access_urls(value):
     """
     Extrai uma ou mais URLs do campo access_url.
 
     Mantém compatibilidade com metadados antigos
-    que podiam conter múltiplas URLs no mesmo campo.
+    que possam conter várias URLs no mesmo campo.
     """
 
     if not value:
         return []
 
-    if isinstance(
-        value,
-        list,
-    ):
+    if isinstance(value, list):
         values = value
 
     else:
@@ -152,11 +160,11 @@ def split_access_urls(value):
 
     urls = []
 
-    for value in values:
+    for item in values:
 
         matches = re.findall(
             r"https?://[^\s]+",
-            str(value),
+            str(item),
         )
 
         for url in matches:
@@ -170,14 +178,65 @@ def split_access_urls(value):
 
 
 # ============================================================
+# VALIDAÇÃO DE PDF EXISTENTE
+# ============================================================
+
+def is_valid_existing_pdf(
+    path: Path,
+) -> bool:
+    """
+    Verifica se um PDF já existente possui
+    assinatura binária válida.
+
+    O teste usa os primeiros bytes do arquivo,
+    procurando pela assinatura padrão %PDF.
+
+    Isso evita considerar como PDF válido uma
+    página HTML salva incorretamente com extensão .pdf.
+    """
+
+    if not path.exists():
+        return False
+
+    if not path.is_file():
+        return False
+
+    try:
+
+        # Um PDF precisa conter pelo menos alguns bytes.
+        if path.stat().st_size < 5:
+            return False
+
+        # Não é necessário carregar o arquivo inteiro.
+        with path.open("rb") as file:
+            header = file.read(8)
+
+        return content_is_pdf_bytes(
+            header,
+            "",
+        )
+
+    except Exception as error:
+
+        print(
+            "Erro ao validar PDF existente:",
+            error,
+        )
+
+        return False
+
+
+# ============================================================
 # EXECUÇÃO
 # ============================================================
 
-
 def run():
     """
-    Executa o downloader para os registros encontrados
-    em data/raw/metadata/records.
+    Executa o downloader para os registros existentes em:
+
+        data/raw/metadata/records/
+
+    PDFs válidos já existentes não são baixados novamente.
     """
 
     create_directories()
@@ -209,17 +268,17 @@ def run():
     # PLAYWRIGHT
     # ========================================================
 
-    with sync_playwright() as p:
+    with sync_playwright() as playwright:
 
         browser = (
-            p.chromium.launch(
-                headless=HEADLESS
+            playwright.chromium.launch(
+                headless=HEADLESS,
             )
         )
 
         context = (
             browser.new_context(
-                ignore_https_errors=True
+                ignore_https_errors=True,
             )
         )
 
@@ -239,9 +298,7 @@ def run():
             )
 
             record_id = (
-                metadata.get(
-                    "record_id"
-                )
+                metadata.get("record_id")
                 or metadata_file.stem
             )
 
@@ -250,10 +307,8 @@ def run():
                 / f"{record_id}.pdf"
             )
 
-            print(
-                "\n"
-                + "=" * 70
-            )
+            print()
+            print("=" * 70)
 
             print(
                 f"[{index}/"
@@ -270,27 +325,72 @@ def run():
 
             if output_file.exists():
 
+                if is_valid_existing_pdf(
+                    output_file
+                ):
+
+                    print(
+                        "PDF já existe e é válido."
+                    )
+
+                    already_exists += 1
+
+                    manifest.append(
+                        {
+                            "record_id": record_id,
+                            "status": (
+                                "already_exists"
+                            ),
+                            "pdf_path": str(
+                                output_file
+                            ),
+                        }
+                    )
+
+                    # Salva antes do continue.
+                    save_manifest(
+                        manifest
+                    )
+
+                    continue
+
                 print(
-                    "PDF já existe."
+                    "PDF existente inválido. "
+                    "Será removido e baixado novamente."
                 )
 
-                already_exists += 1
+                try:
 
-                manifest.append(
-                    {
-                        "record_id": (
-                            record_id
-                        ),
-                        "status": (
-                            "already_exists"
-                        ),
-                        "pdf_path": str(
-                            output_file
-                        ),
-                    }
-                )
+                    output_file.unlink()
 
-                continue
+                except Exception as error:
+
+                    print(
+                        "Não foi possível remover "
+                        "o PDF inválido:",
+                        error,
+                    )
+
+                    failed += 1
+
+                    manifest.append(
+                        {
+                            "record_id": record_id,
+                            "status": "failed",
+                            "reason": (
+                                "invalid_existing_pdf"
+                            ),
+                            "pdf_path": str(
+                                output_file
+                            ),
+                        }
+                    )
+
+                    save_manifest(
+                        manifest
+                    )
+
+                    continue
 
             # ------------------------------------------------
             # URLs de acesso
@@ -310,9 +410,7 @@ def run():
 
                 manifest.append(
                     {
-                        "record_id": (
-                            record_id
-                        ),
+                        "record_id": record_id,
                         "status": (
                             "no_access_url"
                         ),
@@ -324,6 +422,12 @@ def run():
 
                 print(
                     "Sem URL de acesso."
+                )
+
+                # Importante:
+                # salva antes do continue.
+                save_manifest(
+                    manifest
                 )
 
                 continue
@@ -342,8 +446,9 @@ def run():
 
             for access_url in access_urls:
 
+                print()
                 print(
-                    "\nTentando:"
+                    "Tentando:"
                 )
 
                 print(
@@ -381,7 +486,8 @@ def run():
                     success = True
 
                     successful_url = (
-                        access_url
+                        result.get("url")
+                        or access_url
                     )
 
                     break
@@ -398,8 +504,8 @@ def run():
                     final_reason,
                 )
 
-                # Não há motivo para tentar contornar
-                # uma restrição explícita.
+                # Não tenta contornar mecanismos
+                # explícitos de proteção ou restrição.
                 if final_reason in {
                     "restricted_or_embargo",
                     "anti_bot",
@@ -416,9 +522,7 @@ def run():
 
                 manifest.append(
                     {
-                        "record_id": (
-                            record_id
-                        ),
+                        "record_id": record_id,
                         "status": (
                             "downloaded"
                         ),
@@ -449,12 +553,8 @@ def run():
 
                 manifest.append(
                     {
-                        "record_id": (
-                            record_id
-                        ),
-                        "status": (
-                            "failed"
-                        ),
+                        "record_id": record_id,
+                        "status": "failed",
                         "access_urls": (
                             access_urls
                         ),
@@ -468,12 +568,12 @@ def run():
             # Manifesto incremental
             # ------------------------------------------------
 
-            save_json(
-                MANIFEST_DIR
-                / "download_manifest.json",
-                manifest,
+            save_manifest(
+                manifest
             )
 
+            # Pequeno intervalo para reduzir a frequência
+            # de requisições aos repositórios externos.
             time.sleep(1)
 
         browser.close()
@@ -498,6 +598,11 @@ def run():
         failures,
     )
 
+    # Garante que o manifesto final também esteja atualizado.
+    save_manifest(
+        manifest
+    )
+
     total_pdfs = len(
         list(
             PDF_DIR.glob(
@@ -510,10 +615,8 @@ def run():
     # RESUMO
     # ========================================================
 
-    print(
-        "\n"
-        + "=" * 70
-    )
+    print()
+    print("=" * 70)
 
     print(
         "DOWNLOAD FINALIZADO"
@@ -530,12 +633,31 @@ def run():
     )
 
     print(
-        f"Falhas: {failed}"
+        f"Falhas: "
+        f"{failed}"
     )
 
     print(
         f"Total de PDFs: "
         f"{total_pdfs}"
+    )
+
+    print(
+        "Manifesto:"
+    )
+
+    print(
+        MANIFEST_DIR
+        / "download_manifest.json"
+    )
+
+    print(
+        "Falhas:"
+    )
+
+    print(
+        MANIFEST_DIR
+        / "failed_downloads.json"
     )
 
 
