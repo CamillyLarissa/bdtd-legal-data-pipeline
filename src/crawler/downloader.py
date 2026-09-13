@@ -2,6 +2,7 @@
 Orquestrador de download dos PDFs da BDTD.
 
 Entrada:
+    data/raw/metadata/record_urls.json
     data/raw/metadata/records/*.json
 
 Saída:
@@ -12,28 +13,35 @@ Manifestos:
     data/raw/manifests/failed_downloads.json
 
 Responsabilidades:
-- carregar os metadados;
-- percorrer os registros;
+- carregar somente os registros da coleta atual;
+- carregar metadados correspondentes;
 - verificar PDFs existentes;
 - chamar repository_parser;
-- registrar sucessos e falhas.
-
-A descoberta específica dos PDFs pertence ao
-repository_parser.py.
+- registrar sucessos e falhas;
+- preservar resultados incrementalmente.
 """
 
 import json
 import os
 import re
 import time
-from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+from pathlib import Path
+from urllib.parse import (
+    unquote,
+    urlparse,
+)
+
+from playwright.sync_api import (
+    sync_playwright,
+)
 
 from src.config import (
     MANIFEST_DIR,
     METADATA_DIR,
+    METADATA_ROOT_DIR,
     PDF_DIR,
+    RECORD_URLS_FILE,
     create_directories,
 )
 
@@ -53,48 +61,66 @@ from src.crawler.repository_parser import (
 MAX_RECORDS = int(
     os.getenv(
         "BDTD_MAX_RECORDS",
-        "100",
+        "2500",
     )
 )
 
 HEADLESS = (
     os.getenv(
         "BDTD_HEADLESS",
-        "false",
+        "true",
     ).lower()
     == "true"
 )
+
+DELAY_BETWEEN_RECORDS = 1
 
 
 # ============================================================
 # JSON
 # ============================================================
 
-def load_json(path: Path):
-    """Lê um arquivo JSON."""
+def load_json(
+    path: Path,
+):
+    """
+    Lê JSON.
+    """
 
     with path.open(
         "r",
         encoding="utf-8",
     ) as file:
-        return json.load(file)
+
+        return json.load(
+            file
+        )
 
 
 def save_json(
     path: Path,
     data,
 ):
-    """Salva dados em formato JSON."""
+    """
+    Salva JSON.
+    """
 
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    with path.open(
+    temp_file = (
+        path.with_suffix(
+            path.suffix + ".tmp"
+        )
+    )
+
+    with temp_file.open(
         "w",
         encoding="utf-8",
     ) as file:
+
         json.dump(
             data,
             file,
@@ -102,14 +128,16 @@ def save_json(
             indent=2,
         )
 
+    temp_file.replace(
+        path
+    )
 
-def save_manifest(manifest):
+
+def save_manifest(
+    manifest,
+):
     """
-    Salva o manifesto incremental de downloads.
-
-    É utilizado durante a execução para evitar perda
-    das informações já processadas caso o crawler seja
-    interrompido.
+    Salva manifesto incrementalmente.
     """
 
     save_json(
@@ -120,35 +148,290 @@ def save_manifest(manifest):
 
 
 # ============================================================
+# IDENTIFICAÇÃO DE REGISTROS
+# ============================================================
+
+def extract_record_id_from_url(
+    url,
+):
+    """
+    Obtém o ID da URL da BDTD.
+
+    Exemplo:
+
+    https://bdtd.ibict.br/vufind/Record/UFT_abc123
+
+        -> UFT_abc123
+    """
+
+    if not url:
+        return None
+
+    try:
+        path = (
+            unquote(
+                urlparse(
+                    str(url)
+                ).path
+            )
+            .rstrip("/")
+        )
+
+        parts = path.split("/")
+
+        if "Record" in parts:
+
+            index = (
+                parts.index(
+                    "Record"
+                )
+            )
+
+            if (
+                index + 1
+                < len(parts)
+            ):
+                return parts[
+                    index + 1
+                ]
+
+        if parts:
+            return parts[-1]
+
+    except Exception:
+        pass
+
+    return None
+
+
+# ============================================================
+# CORPUS ATUAL
+# ============================================================
+
+def load_current_record_ids():
+    """
+    Lê record_urls.json e retorna somente IDs
+    pertencentes à coleta atual.
+
+    Essa é a fonte oficial do corpus.
+    """
+
+    if not RECORD_URLS_FILE.exists():
+
+        print(
+            "ATENÇÃO: "
+            "record_urls.json não encontrado."
+        )
+
+        return []
+
+    try:
+        data = load_json(
+            RECORD_URLS_FILE
+        )
+
+    except Exception as error:
+
+        print(
+            "Erro ao ler "
+            "record_urls.json:",
+            error,
+        )
+
+        return []
+
+    if isinstance(
+        data,
+        list,
+    ):
+        items = data
+
+    elif isinstance(
+        data,
+        dict,
+    ):
+        items = (
+            data.get(
+                "record_urls",
+                [],
+            )
+        )
+
+    else:
+        items = []
+
+    record_ids = []
+
+    seen = set()
+
+    for item in items:
+
+        if isinstance(
+            item,
+            str,
+        ):
+            url = item
+
+        elif isinstance(
+            item,
+            dict,
+        ):
+            url = (
+                item.get("url")
+                or item.get(
+                    "record_url"
+                )
+                or item.get(
+                    "bdtd_url"
+                )
+            )
+
+        else:
+            continue
+
+        record_id = (
+            extract_record_id_from_url(
+                url
+            )
+        )
+
+        if not record_id:
+            continue
+
+        if record_id in seen:
+            continue
+
+        seen.add(
+            record_id
+        )
+
+        record_ids.append(
+            record_id
+        )
+
+        if (
+            len(record_ids)
+            >= MAX_RECORDS
+        ):
+            break
+
+    return record_ids
+
+
+# ============================================================
 # METADADOS
 # ============================================================
 
 def load_metadata_files():
     """
-    Carrega todos os arquivos individuais de metadados
-    disponíveis na camada Raw.
+    Retorna somente os metadados dos registros
+    pertencentes ao record_urls.json atual.
+
+    Isso evita misturar arquivos antigos de
+    execuções anteriores.
     """
 
-    return sorted(
-        METADATA_DIR.glob("*.json")
+    current_ids = (
+        load_current_record_ids()
     )
 
+    # --------------------------------------------------------
+    # CORPUS ATUAL ENCONTRADO
+    # --------------------------------------------------------
+
+    if current_ids:
+
+        files = []
+
+        missing = []
+
+        for record_id in current_ids:
+
+            metadata_file = (
+                METADATA_DIR
+                / f"{record_id}.json"
+            )
+
+            if metadata_file.exists():
+
+                files.append(
+                    metadata_file
+                )
+
+            else:
+                missing.append(
+                    record_id
+                )
+
+        print(
+            "IDs na coleta atual:",
+            len(current_ids),
+        )
+
+        print(
+            "Metadados disponíveis:",
+            len(files),
+        )
+
+        print(
+            "Metadados ainda faltando:",
+            len(missing),
+        )
+
+        return files
+
+    # --------------------------------------------------------
+    # FALLBACK
+    # --------------------------------------------------------
+
+    print()
+    print(
+        "AVISO:"
+    )
+
+    print(
+        "Não foi possível identificar "
+        "o corpus atual pelo "
+        "record_urls.json."
+    )
+
+    print(
+        "Usando todos os metadados "
+        "como fallback."
+    )
+
+    return sorted(
+        METADATA_DIR.glob(
+            "*.json"
+        )
+    )[
+        :MAX_RECORDS
+    ]
+
+
 # ============================================================
-# URLs
+# URLS
 # ============================================================
 
-def split_access_urls(value):
+def split_access_urls(
+    value,
+):
     """
-    Extrai uma ou mais URLs do campo access_url.
+    Extrai uma ou mais URLs de access_url.
 
-    Mantém compatibilidade com metadados antigos
-    que possam conter várias URLs no mesmo campo.
+    Compatível com:
+    - string;
+    - lista;
+    - várias URLs separadas por linha.
     """
 
     if not value:
         return []
 
-    if isinstance(value, list):
+    if isinstance(
+        value,
+        list,
+    ):
         values = value
 
     else:
@@ -168,30 +451,33 @@ def split_access_urls(value):
 
         for url in matches:
 
-            url = url.strip()
+            url = (
+                url.strip()
+                .rstrip(
+                    ".,);]"
+                )
+            )
 
             if url not in urls:
-                urls.append(url)
+                urls.append(
+                    url
+                )
 
     return urls
 
 
 # ============================================================
-# VALIDAÇÃO DE PDF EXISTENTE
+# PDF EXISTENTE
 # ============================================================
 
 def is_valid_existing_pdf(
     path: Path,
-) -> bool:
+):
     """
-    Verifica se um PDF já existente possui
-    assinatura binária válida.
+    Verifica assinatura binária do arquivo PDF.
 
-    O teste usa os primeiros bytes do arquivo,
-    procurando pela assinatura padrão %PDF.
-
-    Isso evita considerar como PDF válido uma
-    página HTML salva incorretamente com extensão .pdf.
+    Evita considerar páginas HTML salvas
+    incorretamente como PDF.
     """
 
     if not path.exists():
@@ -201,24 +487,28 @@ def is_valid_existing_pdf(
         return False
 
     try:
-
-        # Um PDF precisa conter pelo menos alguns bytes.
         if path.stat().st_size < 5:
             return False
 
-        # Não é necessário carregar o arquivo inteiro.
-        with path.open("rb") as file:
-            header = file.read(8)
+        with path.open(
+            "rb"
+        ) as file:
 
-        return content_is_pdf_bytes(
-            header,
-            "",
+            header = (
+                file.read(8)
+            )
+
+        return (
+            content_is_pdf_bytes(
+                header,
+                "",
+            )
         )
 
     except Exception as error:
 
         print(
-            "Erro ao validar PDF existente:",
+            "Erro ao validar PDF:",
             error,
         )
 
@@ -226,16 +516,12 @@ def is_valid_existing_pdf(
 
 
 # ============================================================
-# EXECUÇÃO
+# PROCESSAMENTO PRINCIPAL
 # ============================================================
 
 def run():
     """
-    Executa o downloader para os registros existentes em:
-
-        data/raw/metadata/records/
-
-    PDFs válidos já existentes não são baixados novamente.
+    Executa o downloader.
     """
 
     create_directories()
@@ -244,17 +530,32 @@ def run():
         load_metadata_files()
     )
 
+    print()
     print(
-        f"Metadados encontrados: "
-        f"{len(metadata_files)}"
+        "=" * 70
     )
 
     print(
-        f"PDF_DIR: {PDF_DIR}"
+        "DOWNLOAD DE PDFs"
     )
 
     print(
-        f"HEADLESS: {HEADLESS}"
+        "=" * 70
+    )
+
+    print(
+        "Metadados encontrados:",
+        len(metadata_files),
+    )
+
+    print(
+        "PDF_DIR:",
+        PDF_DIR,
+    )
+
+    print(
+        "HEADLESS:",
+        HEADLESS,
     )
 
     downloaded_now = 0
@@ -278,10 +579,20 @@ def run():
         context = (
             browser.new_context(
                 ignore_https_errors=True,
+                user_agent=(
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) "
+                    "Chrome/152.0.0.0 "
+                    "Safari/537.36"
+                ),
             )
         )
 
-        page = context.new_page()
+        page = (
+            context.new_page()
+        )
 
         # ====================================================
         # REGISTROS
@@ -292,12 +603,56 @@ def run():
             start=1,
         ):
 
-            metadata = load_json(
-                metadata_file
-            )
+            try:
+                metadata = load_json(
+                    metadata_file
+                )
+
+            except Exception as error:
+
+                print()
+                print(
+                    "=" * 70
+                )
+
+                print(
+                    f"[{index}/"
+                    f"{len(metadata_files)}]"
+                )
+
+                print(
+                    "Erro ao ler metadado:",
+                    metadata_file,
+                )
+
+                print(
+                    error
+                )
+
+                failed += 1
+
+                manifest.append(
+                    {
+                        "record_id": (
+                            metadata_file.stem
+                        ),
+                        "status": "failed",
+                        "reason": (
+                            "metadata_read_error"
+                        ),
+                    }
+                )
+
+                save_manifest(
+                    manifest
+                )
+
+                continue
 
             record_id = (
-                metadata.get("record_id")
+                metadata.get(
+                    "record_id"
+                )
                 or metadata_file.stem
             )
 
@@ -307,7 +662,9 @@ def run():
             )
 
             print()
-            print("=" * 70)
+            print(
+                "=" * 70
+            )
 
             print(
                 f"[{index}/"
@@ -315,12 +672,13 @@ def run():
             )
 
             print(
-                f"Registro: {record_id}"
+                "Registro:",
+                record_id,
             )
 
-            # ------------------------------------------------
-            # PDF já existe
-            # ------------------------------------------------
+            # =================================================
+            # PDF JÁ EXISTE
+            # =================================================
 
             if output_file.exists():
 
@@ -329,14 +687,17 @@ def run():
                 ):
 
                     print(
-                        "PDF já existe e é válido."
+                        "PDF já existe "
+                        "e é válido."
                     )
 
                     already_exists += 1
 
                     manifest.append(
                         {
-                            "record_id": record_id,
+                            "record_id": (
+                                record_id
+                            ),
                             "status": (
                                 "already_exists"
                             ),
@@ -346,7 +707,6 @@ def run():
                         }
                     )
 
-                    # Salva antes do continue.
                     save_manifest(
                         manifest
                     )
@@ -354,19 +714,22 @@ def run():
                     continue
 
                 print(
-                    "PDF existente inválido. "
-                    "Será removido e baixado novamente."
+                    "PDF existente inválido."
+                )
+
+                print(
+                    "Removendo para tentar "
+                    "novamente."
                 )
 
                 try:
-
                     output_file.unlink()
 
                 except Exception as error:
 
                     print(
-                        "Não foi possível remover "
-                        "o PDF inválido:",
+                        "Não foi possível "
+                        "remover:",
                         error,
                     )
 
@@ -374,13 +737,12 @@ def run():
 
                     manifest.append(
                         {
-                            "record_id": record_id,
+                            "record_id": (
+                                record_id
+                            ),
                             "status": "failed",
                             "reason": (
                                 "invalid_existing_pdf"
-                            ),
-                            "pdf_path": str(
-                                output_file
                             ),
                         }
                     )
@@ -391,9 +753,9 @@ def run():
 
                     continue
 
-            # ------------------------------------------------
-            # URLs de acesso
-            # ------------------------------------------------
+            # =================================================
+            # URLS DE ACESSO
+            # =================================================
 
             access_urls = (
                 split_access_urls(
@@ -405,11 +767,17 @@ def run():
 
             if not access_urls:
 
+                print(
+                    "Sem URL de acesso."
+                )
+
                 failed += 1
 
                 manifest.append(
                     {
-                        "record_id": record_id,
+                        "record_id": (
+                            record_id
+                        ),
                         "status": (
                             "no_access_url"
                         ),
@@ -419,17 +787,16 @@ def run():
                     }
                 )
 
-                print(
-                    "Sem URL de acesso."
-                )
-
-                # Importante:
-                # salva antes do continue.
                 save_manifest(
                     manifest
                 )
 
                 continue
+
+            print(
+                "URLs de acesso:",
+                len(access_urls),
+            )
 
             success = False
 
@@ -439,15 +806,15 @@ def run():
 
             successful_url = None
 
-            # ------------------------------------------------
-            # Tenta cada URL disponível
-            # ------------------------------------------------
+            # =================================================
+            # TENTA CADA URL
+            # =================================================
 
             for access_url in access_urls:
 
                 print()
                 print(
-                    "Tentando:"
+                    "Tentando repositório:"
                 )
 
                 print(
@@ -455,7 +822,6 @@ def run():
                 )
 
                 try:
-
                     result = (
                         process_repository_url(
                             page,
@@ -480,7 +846,9 @@ def run():
                         ),
                     }
 
-                if result["success"]:
+                if result.get(
+                    "success"
+                ):
 
                     success = True
 
@@ -503,17 +871,19 @@ def run():
                     final_reason,
                 )
 
-                # Não tenta contornar mecanismos
-                # explícitos de proteção ou restrição.
+                # ---------------------------------------------
+                # NÃO TENTA CONTORNAR PROTEÇÕES
+                # ---------------------------------------------
+
                 if final_reason in {
                     "restricted_or_embargo",
                     "anti_bot",
                 }:
                     break
 
-            # ------------------------------------------------
+            # =================================================
             # SUCESSO
-            # ------------------------------------------------
+            # =================================================
 
             if success:
 
@@ -521,7 +891,9 @@ def run():
 
                 manifest.append(
                     {
-                        "record_id": record_id,
+                        "record_id": (
+                            record_id
+                        ),
                         "status": (
                             "downloaded"
                         ),
@@ -542,9 +914,9 @@ def run():
                     output_file
                 )
 
-            # ------------------------------------------------
+            # =================================================
             # FALHA
-            # ------------------------------------------------
+            # =================================================
 
             else:
 
@@ -552,7 +924,9 @@ def run():
 
                 manifest.append(
                     {
-                        "record_id": record_id,
+                        "record_id": (
+                            record_id
+                        ),
                         "status": "failed",
                         "access_urls": (
                             access_urls
@@ -563,17 +937,17 @@ def run():
                     }
                 )
 
-            # ------------------------------------------------
-            # Manifesto incremental
-            # ------------------------------------------------
+            # =================================================
+            # MANIFESTO INCREMENTAL
+            # =================================================
 
             save_manifest(
                 manifest
             )
 
-            # Pequeno intervalo para reduzir a frequência
-            # de requisições aos repositórios externos.
-            time.sleep(1)
+            time.sleep(
+                DELAY_BETWEEN_RECORDS
+            )
 
         browser.close()
 
@@ -597,10 +971,13 @@ def run():
         failures,
     )
 
-    # Garante que o manifesto final também esteja atualizado.
     save_manifest(
         manifest
     )
+
+    # ========================================================
+    # CONTAGEM DOS PDFs
+    # ========================================================
 
     total_pdfs = len(
         list(
@@ -615,30 +992,41 @@ def run():
     # ========================================================
 
     print()
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
 
     print(
         "DOWNLOAD FINALIZADO"
     )
 
     print(
-        f"Baixados agora: "
-        f"{downloaded_now}"
+        "=" * 70
     )
 
     print(
-        f"Já existentes: "
-        f"{already_exists}"
+        "Processados:",
+        len(metadata_files),
     )
 
     print(
-        f"Falhas: "
-        f"{failed}"
+        "Baixados agora:",
+        downloaded_now,
     )
 
     print(
-        f"Total de PDFs: "
-        f"{total_pdfs}"
+        "Já existentes:",
+        already_exists,
+    )
+
+    print(
+        "Falhas:",
+        failed,
+    )
+
+    print(
+        "Total de PDFs na pasta:",
+        total_pdfs,
     )
 
     print(
