@@ -1,9 +1,8 @@
 """
 Preparação do dataset da camada Curated para Pré-Treino Continuado (Continued Pretraining - CPT).
 
-Entrada:
+Entrada estrita:
     data/processed/04_anonymized/*.json
-    (com fallback para 03_deduplicated, 02_normalized, 01_standardized ou 00_staging se a camada anterior não existir)
 
 Saídas:
     data/curated/pretraining/pretraining_corpus.jsonl
@@ -22,11 +21,7 @@ from pathlib import Path
 
 from src.config import (
     ANONYMIZED_DIR,
-    DEDUPLICATED_DIR,
-    NORMALIZED_DIR,
     PRETRAINING_DIR,
-    STANDARDIZED_DIR,
-    STAGING_DIR,
     create_directories,
     env_int,
 )
@@ -50,33 +45,10 @@ logger = logging.getLogger(__name__)
 END_OF_DOC_TOKEN = "<|endoftext|>"
 
 
-def get_input_directory() -> Path:
-    """
-    Retorna o diretório de entrada prioritário para o pré-treino continuado.
-    Prioridade: ANONYMIZED_DIR > DEDUPLICATED_DIR > NORMALIZED_DIR > STANDARDIZED_DIR > STAGING_DIR
-    """
-    candidates = [
-        ANONYMIZED_DIR,
-        DEDUPLICATED_DIR,
-        NORMALIZED_DIR,
-        STANDARDIZED_DIR,
-        STAGING_DIR,
-    ]
-
-    for path in candidates:
-        if path.exists() and list(path.glob("*.json")):
-            valid_files = [f for f in path.glob("*.json") if f.name not in {"duplicates.json", "anonymization_stats.json"}]
-            if valid_files:
-                logger.info(f"Usando pasta de entrada: {path} ({len(valid_files)} arquivos)")
-                return path
-
-    logger.warning("Nenhum diretório com arquivos JSON de entrada encontrado.")
-    return ANONYMIZED_DIR
-
-
 def extract_full_text_from_doc(data: dict) -> tuple[str, int]:
     """
     Concatena o texto de todas as páginas de um documento em uma única string fluida.
+    Suporta tanto o esquema do Staging (data['pages']) quanto o esquema da camada Processed (data['document']['pages']).
 
     Retorna:
     - texto completo do documento (str)
@@ -84,14 +56,22 @@ def extract_full_text_from_doc(data: dict) -> tuple[str, int]:
     """
     pages_text = []
 
-    if "pages" in data and isinstance(data["pages"], list):
-        for page_info in data["pages"]:
+    pages_list = []
+    if "document" in data and isinstance(data["document"], dict) and "pages" in data["document"]:
+        pages_list = data["document"]["pages"]
+    elif "pages" in data and isinstance(data["pages"], list):
+        pages_list = data["pages"]
+
+    if pages_list:
+        for page_info in pages_list:
             if isinstance(page_info, dict) and "text" in page_info:
-                txt = page_info["text"].strip()
+                txt = page_info["text"].strip() if page_info["text"] else ""
                 if txt:
                     pages_text.append(txt)
     elif "text" in data and isinstance(data["text"], str):
-        pages_text.append(data["text"].strip())
+        txt = data["text"].strip()
+        if txt:
+            pages_text.append(txt)
 
     full_text = "\n\n".join(pages_text)
     total_pages = len(pages_text)
@@ -104,10 +84,10 @@ def run(max_files: int | None = None) -> tuple[int, int]:
     Executa o empacotamento dos documentos no formato de dataset para Pré-Treino Continuado.
     """
     create_directories()
-    input_dir = get_input_directory()
+    input_dir = ANONYMIZED_DIR
 
     if not input_dir.exists():
-        logger.warning(f"Diretório de entrada {input_dir} não existe.")
+        logger.warning(f"Diretório de entrada estrito {input_dir} não existe.")
         return 0, 0
 
     json_files = sorted([
@@ -116,12 +96,13 @@ def run(max_files: int | None = None) -> tuple[int, int]:
     ])
 
     if not json_files:
-        logger.warning(f"Nenhum arquivo JSON encontrado para pré-treino em {input_dir}.")
+        logger.warning(f"Nenhum arquivo JSON encontrado para pré-treino em {input_dir} (04_anonymized).")
         return 0, 0
 
     if max_files and max_files > 0:
         json_files = json_files[:max_files]
 
+    logger.info(f"Usando pasta de entrada estrita: {input_dir} ({len(json_files)} arquivos)")
     logger.info(f"Iniciando preparação do dataset de pré-treino para {len(json_files)} documentos...")
 
     PRETRAINING_DIR.mkdir(parents=True, exist_ok=True)
@@ -167,7 +148,7 @@ def run(max_files: int | None = None) -> tuple[int, int]:
                     "id": record_id,
                     "text": full_text,
                     "metadata": {
-                        "source_pdf": doc_data.get("source_pdf", ""),
+                        "source_pdf": doc_data.get("source_pdf", doc_data.get("document", {}).get("source_pdf", "")),
                         "total_pages": doc_pages,
                         "word_count": words_count,
                         "char_count": chars_count,
@@ -190,7 +171,6 @@ def run(max_files: int | None = None) -> tuple[int, int]:
                 errors += 1
                 logger.error(f"Erro ao processar {file_path.name} para pré-treino: {err}")
 
-    # Estimativa de tokens para LLMs (aprox. 1 token = 0.75 palavras ou 4 caracteres em português)
     estimated_tokens = int(total_words / 0.75) if total_words > 0 else 0
 
     summary_data = {
