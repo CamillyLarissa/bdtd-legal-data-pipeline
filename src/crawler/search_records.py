@@ -10,7 +10,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 
 # ============================================================
-# CONFIGURAÇÃO
+# CONFIGURAÇÕES
 # ============================================================
 
 BASE_URL = "https://bdtd.ibict.br/vufind/Search/Results"
@@ -25,7 +25,7 @@ DATA_DIR = Path(
 MAX_RECORDS = int(
     os.getenv(
         "BDTD_MAX_RECORDS",
-        "200"
+        "2500"
     )
 )
 
@@ -48,22 +48,16 @@ RECORD_URLS_FILE = (
     / "record_urls.json"
 )
 
-# Quantas vezes tentar a mesma página
 MAX_RETRIES_PER_PAGE = 8
 
-# Espera base quando a BDTD recusar conexão
 RETRY_WAIT_SECONDS = 30
 
-# Pequena pausa entre páginas normais
 MIN_PAGE_DELAY = 1.5
 MAX_PAGE_DELAY = 3.0
 
-# Quantidade padrão de resultados por página
-RESULTS_PER_PAGE = 20
-
 
 # ============================================================
-# FILTRO OFICIAL DO CORPUS
+# FILTRO CNPQ DE DIREITO
 # ============================================================
 
 CNPQ_FILTER = (
@@ -73,7 +67,34 @@ CNPQ_FILTER = (
 
 
 # ============================================================
-# UTILIDADES
+# ANOS
+# ============================================================
+
+START_YEAR = int(
+    os.getenv(
+        "BDTD_START_YEAR",
+        "2026"
+    )
+)
+
+END_YEAR = int(
+    os.getenv(
+        "BDTD_END_YEAR",
+        "1990"
+    )
+)
+
+YEARS = list(
+    range(
+        START_YEAR,
+        END_YEAR - 1,
+        -1
+    )
+)
+
+
+# ============================================================
+# DIRETÓRIOS
 # ============================================================
 
 def create_directories():
@@ -83,19 +104,43 @@ def create_directories():
     )
 
 
-def build_search_url(page_number):
+# ============================================================
+# URL DE BUSCA
+# ============================================================
+
+def build_search_url(
+    page_number,
+    year
+):
     """
-    Monta a URL da busca da BDTD usando
-    o filtro CNPq da área Direito.
+    Busca documentos da área Direito
+    em um determinado ano.
+
+    A divisão por ano evita depender de uma única
+    consulta com paginação limitada.
     """
 
     params = [
-        ("lookfor", ""),
-        ("type", "AllFields"),
+        (
+            "lookfor",
+            ""
+        ),
+
+        (
+            "type",
+            "AllFields"
+        ),
+
         (
             "filter[]",
             CNPQ_FILTER
         ),
+
+        (
+            "filter[]",
+            f"publishDate:[{year} TO {year}]"
+        ),
+
         (
             "page",
             page_number
@@ -109,10 +154,15 @@ def build_search_url(page_number):
     )
 
 
-def extract_record_urls(page):
+# ============================================================
+# EXTRAÇÃO DE URLs
+# ============================================================
+
+def extract_record_urls(
+    page
+):
     """
-    Extrai os links dos registros individuais
-    presentes na página de resultados.
+    Extrai as URLs dos registros da BDTD.
     """
 
     urls = []
@@ -121,157 +171,229 @@ def extract_record_urls(page):
         'a[href*="/vufind/Record/"]'
     )
 
-    count = links.count()
+    try:
+        count = links.count()
 
-    for i in range(count):
+    except Exception:
+        return []
+
+    for index in range(
+        count
+    ):
+
         try:
-            href = links.nth(i).get_attribute(
-                "href"
-            )
-
-            if not href:
-                continue
-
-            if href.startswith("/"):
-                href = (
-                    "https://bdtd.ibict.br"
-                    + href
+            href = (
+                links
+                .nth(index)
+                .get_attribute(
+                    "href"
                 )
-
-            if "/vufind/Record/" not in href:
-                continue
-
-            # Remove parâmetros extras da URL
-            href = href.split("?")[0]
-
-            urls.append(href)
+            )
 
         except Exception:
             continue
 
-    # Remove duplicatas preservando ordem
-    unique_urls = list(
-        dict.fromkeys(urls)
+        if not href:
+            continue
+
+        href = href.strip()
+
+        if href.startswith("/"):
+            href = (
+                "https://bdtd.ibict.br"
+                + href
+            )
+
+        if "/vufind/Record/" not in href:
+            continue
+
+        href = (
+            href
+            .split("?")[0]
+        )
+
+        urls.append(
+            href
+        )
+
+    return list(
+        dict.fromkeys(
+            urls
+        )
     )
 
-    return unique_urls
 
+# ============================================================
+# CARREGA COLETA ANTERIOR
+# ============================================================
 
-def load_existing_urls():
+def load_existing_data():
     """
-    Carrega coleta anterior, caso exista.
+    Lê record_urls.json anterior.
 
-    Isso impede que uma falha momentânea
-    sobrescreva uma coleta válida.
+    Retorna:
+    - URLs existentes;
+    - anos já processados.
     """
 
     if not RECORD_URLS_FILE.exists():
-        return []
+        return [], []
 
     try:
         with RECORD_URLS_FILE.open(
             "r",
             encoding="utf-8"
-        ) as f:
-            data = json.load(f)
+        ) as file:
 
-        if isinstance(data, list):
-            return data
+            data = json.load(
+                file
+            )
 
-        if isinstance(data, dict):
-            return data.get(
+    except Exception as error:
+
+        print(
+            "Não foi possível ler "
+            "record_urls.json:",
+            error
+        )
+
+        return [], []
+
+    # Arquivo antigo em formato lista
+    if isinstance(
+        data,
+        list
+    ):
+        return data, []
+
+    if isinstance(
+        data,
+        dict
+    ):
+
+        urls = (
+            data.get(
                 "record_urls",
                 []
             )
-
-    except Exception as exc:
-        print(
-            f"Aviso: não foi possível "
-            f"carregar coleta anterior: {exc}"
         )
 
-    return []
+        years = (
+            data.get(
+                "anos_processados",
+                []
+            )
+        )
+
+        return (
+            urls,
+            years
+        )
+
+    return [], []
 
 
-def save_urls(urls):
+# ============================================================
+# SALVAMENTO
+# ============================================================
+
+def save_urls(
+    urls,
+    years_processed
+):
     """
-    Salva progresso incrementalmente.
+    Salva progresso da coleta.
     """
 
     payload = {
         "area": "Direito",
+
         "filtro": (
             "CNPQ::CIENCIAS SOCIAIS "
             "APLICADAS::DIREITO"
         ),
-        "total": len(urls),
-        "record_urls": urls,
+
+        "estrategia": (
+            "particionamento por ano"
+        ),
+
+        "anos_processados": (
+            years_processed
+        ),
+
+        "total": (
+            len(urls)
+        ),
+
+        "record_urls": (
+            urls
+        ),
     }
 
     temp_file = (
         RECORD_URLS_FILE
-        .with_suffix(".tmp")
+        .with_suffix(
+            ".tmp"
+        )
     )
 
     with temp_file.open(
         "w",
         encoding="utf-8"
-    ) as f:
+    ) as file:
+
         json.dump(
             payload,
-            f,
+            file,
             ensure_ascii=False,
             indent=2
         )
 
-    # Escrita atômica:
-    # só substitui o arquivo final
-    # depois que o JSON foi escrito.
     temp_file.replace(
         RECORD_URLS_FILE
     )
 
 
-def wait_before_retry(attempt):
+# ============================================================
+# RETRY
+# ============================================================
+
+def wait_before_retry(
+    attempt
+):
     """
-    Espera progressivamente mais entre
-    as tentativas da mesma página.
+    Aumenta gradualmente o intervalo
+    entre tentativas.
     """
 
-    wait_time = (
-        RETRY_WAIT_SECONDS
-        * attempt
-    )
-
-    # Limita a espera máxima
     wait_time = min(
-        wait_time,
+        RETRY_WAIT_SECONDS
+        * attempt,
         180
     )
 
     print(
-        f"Aguardando {wait_time}s "
-        "antes de tentar novamente..."
+        f"Aguardando "
+        f"{wait_time}s..."
     )
 
-    time.sleep(wait_time)
+    time.sleep(
+        wait_time
+    )
 
-
-# ============================================================
-# ABERTURA DA PÁGINA COM RETRY
-# ============================================================
 
 def open_page_with_retry(
     page,
-    page_number
+    page_number,
+    year
 ):
     """
-    Tenta abrir a mesma página várias vezes
-    antes de desistir.
+    Tenta abrir a mesma página várias vezes.
     """
 
     url = build_search_url(
-        page_number
+        page_number,
+        year
     )
 
     for attempt in range(
@@ -279,41 +401,37 @@ def open_page_with_retry(
         MAX_RETRIES_PER_PAGE + 1
     ):
 
-        print()
         print(
-            f"Tentativa {attempt}/"
+            f"Tentativa "
+            f"{attempt}/"
             f"{MAX_RETRIES_PER_PAGE}"
         )
 
         try:
             response = page.goto(
                 url,
-                wait_until="domcontentloaded",
+                wait_until=(
+                    "domcontentloaded"
+                ),
                 timeout=60000
             )
 
-            # Pequena espera para a página
-            # terminar de renderizar.
             page.wait_for_timeout(
                 1500
             )
 
-            title = page.title()
-
-            print(
-                f"Título: {title}"
-            )
-
-            # Se houve resposta HTTP,
-            # mostra o status.
             if response is not None:
-                print(
-                    "HTTP:",
+
+                status = (
                     response.status
                 )
 
-                # Erros temporários do servidor
-                if response.status in {
+                print(
+                    "HTTP:",
+                    status
+                )
+
+                if status in {
                     429,
                     500,
                     502,
@@ -321,17 +439,18 @@ def open_page_with_retry(
                     504,
                 }:
                     raise RuntimeError(
-                        f"HTTP {response.status}"
+                        f"HTTP {status}"
                     )
 
-            # Verifica páginas de erro
             body_text = (
-                page.locator("body")
+                page.locator(
+                    "body"
+                )
                 .inner_text()
                 .lower()
             )
 
-            error_markers = [
+            markers = [
                 "cannot connect",
                 "connection refused",
                 "service unavailable",
@@ -342,22 +461,22 @@ def open_page_with_retry(
 
             if any(
                 marker in body_text
-                for marker in error_markers
+                for marker in markers
             ):
                 raise RuntimeError(
-                    "Página de erro/indisponibilidade"
+                    "Página indisponível"
                 )
 
-            return True, url
+            return True
 
         except (
             PlaywrightTimeoutError,
             Exception
-        ) as exc:
+        ) as error:
 
             print(
-                f"Erro ao abrir página "
-                f"{page_number}: {exc}"
+                "Erro:",
+                error
             )
 
             if (
@@ -368,248 +487,402 @@ def open_page_with_retry(
                     attempt
                 )
 
-    return False, url
+    return False
 
 
 # ============================================================
-# BUSCA
+# BUSCA PRINCIPAL
 # ============================================================
 
 def main():
     create_directories()
 
     print(
-        "Consulta: Direito"
+        "=" * 70
     )
+
     print(
-        f"Limite: {MAX_RECORDS}"
+        "BUSCA BDTD - DIREITO"
     )
 
-    existing_urls = (
-        load_existing_urls()
+    print(
+        "=" * 70
     )
 
-    # Começamos uma nova coleta,
-    # mas preservamos a antiga em memória.
+    print(
+        "Meta:",
+        MAX_RECORDS
+    )
+
+    print(
+        "Ano inicial:",
+        START_YEAR
+    )
+
+    print(
+        "Ano final:",
+        END_YEAR
+    )
+
+    # --------------------------------------------------------
+    # NÃO reaproveitamos automaticamente URLs antigas
+    # como corpus oficial.
+    #
+    # O arquivo anterior é apenas preservado em caso de
+    # indisponibilidade completa.
+    # --------------------------------------------------------
+
+    old_urls, _ = (
+        load_existing_data()
+    )
+
     collected_urls = []
 
     seen = set()
 
-    page_number = 1
+    years_processed = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=HEADLESS
-        )
+    # ========================================================
+    # PLAYWRIGHT
+    # ========================================================
 
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/152.0.0.0 "
-                "Safari/537.36"
+    with sync_playwright() as playwright:
+
+        browser = (
+            playwright
+            .chromium
+            .launch(
+                headless=HEADLESS
             )
         )
 
-        page = context.new_page()
+        context = (
+            browser
+            .new_context(
+                ignore_https_errors=True,
+                user_agent=(
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) "
+                    "Chrome/152.0.0.0 "
+                    "Safari/537.36"
+                ),
+            )
+        )
+
+        page = (
+            context
+            .new_page()
+        )
 
         try:
-            while (
-                len(collected_urls)
-                < MAX_RECORDS
-            ):
+
+            # =================================================
+            # ANOS
+            # =================================================
+
+            for year in YEARS:
+
+                if (
+                    len(collected_urls)
+                    >= MAX_RECORDS
+                ):
+                    break
+
                 print()
                 print(
-                    "=" * 70
-                )
-                print(
-                    f"Página {page_number}"
-                )
-
-                search_url = (
-                    build_search_url(
-                        page_number
-                    )
+                    "#" * 70
                 )
 
                 print(
-                    search_url
+                    f"ANO {year}"
                 )
 
-                success, _ = (
-                    open_page_with_retry(
-                        page,
-                        page_number
-                    )
+                print(
+                    "#" * 70
                 )
 
-                # ====================================================
-                # BDTD ficou indisponível
-                # ====================================================
+                page_number = 1
 
-                if not success:
+                year_total = 0
+
+                year_seen = set()
+
+                year_completed = False
+
+                # =================================================
+                # PÁGINAS
+                # =================================================
+
+                while (
+                    len(collected_urls)
+                    < MAX_RECORDS
+                ):
+
                     print()
                     print(
-                        "BDTD indisponível após "
-                        "todas as tentativas."
+                        "=" * 70
                     )
 
                     print(
-                        "A coleta parcial será "
-                        "preservada."
+                        f"Ano {year} "
+                        f"- Página "
+                        f"{page_number}"
                     )
 
-                    break
-
-                # ====================================================
-                # EXTRAI LINKS
-                # ====================================================
-
-                page_urls = (
-                    extract_record_urls(
-                        page
-                    )
-                )
-
-                found_count = len(
-                    page_urls
-                )
-
-                print(
-                    "Encontrados na página:",
-                    found_count
-                )
-
-                # ====================================================
-                # SEM RESULTADOS
-                # ====================================================
-
-                if found_count == 0:
-                    print(
-                        "Nenhum registro encontrado."
+                    search_url = (
+                        build_search_url(
+                            page_number,
+                            year
+                        )
                     )
 
                     print(
-                        "Fim dos resultados."
+                        search_url
                     )
 
-                    break
-
-                # ====================================================
-                # ADICIONA NOVOS
-                # ====================================================
-
-                new_count = 0
-
-                for url in page_urls:
-                    if url in seen:
-                        continue
-
-                    seen.add(url)
-
-                    collected_urls.append(
-                        url
+                    opened = (
+                        open_page_with_retry(
+                            page,
+                            page_number,
+                            year
+                        )
                     )
 
-                    new_count += 1
+                    # ---------------------------------------------
+                    # Falha temporária
+                    # ---------------------------------------------
 
-                    if (
-                        len(collected_urls)
-                        >= MAX_RECORDS
-                    ):
+                    if not opened:
+
+                        print()
+                        print(
+                            "Não foi possível "
+                            "continuar este ano."
+                        )
+
+                        print(
+                            "O progresso já coletado "
+                            "será preservado."
+                        )
+
                         break
 
+                    # ---------------------------------------------
+                    # Extrai registros
+                    # ---------------------------------------------
+
+                    page_urls = (
+                        extract_record_urls(
+                            page
+                        )
+                    )
+
+                    print(
+                        "Encontrados:",
+                        len(page_urls)
+                    )
+
+                    # ---------------------------------------------
+                    # Fim dos resultados
+                    # ---------------------------------------------
+
+                    if not page_urls:
+
+                        print(
+                            "Nenhum resultado "
+                            "nesta página."
+                        )
+
+                        year_completed = True
+
+                        break
+
+                    new_global = 0
+                    new_year = 0
+
+                    # ---------------------------------------------
+                    # Adiciona registros
+                    # ---------------------------------------------
+
+                    for record_url in (
+                        page_urls
+                    ):
+
+                        # Repetição dentro do mesmo ano
+                        if (
+                            record_url
+                            in year_seen
+                        ):
+                            continue
+
+                        year_seen.add(
+                            record_url
+                        )
+
+                        new_year += 1
+
+                        # Duplicado entre anos
+                        if (
+                            record_url
+                            in seen
+                        ):
+                            continue
+
+                        seen.add(
+                            record_url
+                        )
+
+                        collected_urls.append(
+                            record_url
+                        )
+
+                        year_total += 1
+                        new_global += 1
+
+                        if (
+                            len(collected_urls)
+                            >= MAX_RECORDS
+                        ):
+                            break
+
+                    print(
+                        "Novos na página:",
+                        new_global
+                    )
+
+                    print(
+                        f"Total {year}:",
+                        year_total
+                    )
+
+                    print(
+                        "Total geral:",
+                        len(collected_urls)
+                    )
+
+                    # ---------------------------------------------
+                    # Salva imediatamente
+                    # ---------------------------------------------
+
+                    if collected_urls:
+
+                        save_urls(
+                            collected_urls,
+                            years_processed
+                            + [year]
+                        )
+
+                    # ---------------------------------------------
+                    # Paginação começou a repetir
+                    # ---------------------------------------------
+
+                    if new_year == 0:
+
+                        print(
+                            "A página repetiu "
+                            "registros anteriores."
+                        )
+
+                        print(
+                            f"Fim da paginação "
+                            f"de {year}."
+                        )
+
+                        year_completed = True
+
+                        break
+
+                    page_number += 1
+
+                    time.sleep(
+                        random.uniform(
+                            MIN_PAGE_DELAY,
+                            MAX_PAGE_DELAY
+                        )
+                    )
+
+                # =================================================
+                # FIM DO ANO
+                # =================================================
+
+                if year_completed:
+
+                    years_processed.append(
+                        year
+                    )
+
+                print()
                 print(
-                    "Novos:",
-                    new_count
+                    f"Fim de {year}"
                 )
 
                 print(
-                    "Total coletado:",
+                    "Novos registros:",
+                    year_total
+                )
+
+                print(
+                    "Total geral:",
                     len(collected_urls)
                 )
 
-                # ====================================================
-                # SALVAMENTO INCREMENTAL
-                # ====================================================
-
                 if collected_urls:
+
                     save_urls(
-                        collected_urls
+                        collected_urls,
+                        years_processed
                     )
-
-                # ====================================================
-                # PROTEÇÃO CONTRA LOOP
-                # ====================================================
-
-                if new_count == 0:
-                    print(
-                        "Página sem novos registros."
-                    )
-
-                    print(
-                        "Interrompendo para evitar loop."
-                    )
-
-                    break
-
-                page_number += 1
-
-                time.sleep(
-                    random.uniform(
-                        MIN_PAGE_DELAY,
-                        MAX_PAGE_DELAY
-                    )
-                )
 
         finally:
+
             context.close()
             browser.close()
 
-    # ============================================================
-    # FINALIZAÇÃO SEGURA
-    # ============================================================
+    # ========================================================
+    # FINALIZAÇÃO
+    # ========================================================
 
     if collected_urls:
+
         save_urls(
-            collected_urls
+            collected_urls,
+            years_processed
         )
 
         final_urls = (
             collected_urls
         )
 
+    elif old_urls:
+
+        print()
+        print(
+            "Nenhuma nova coleta foi "
+            "possível."
+        )
+
+        print(
+            "Preservando arquivo "
+            "anterior."
+        )
+
+        final_urls = old_urls
+
     else:
-        # Se nenhuma página conseguiu ser
-        # coletada, preserva coleta anterior.
-        if existing_urls:
-            print()
-            print(
-                "Nenhum registro novo foi "
-                "coletado."
-            )
 
-            print(
-                "Mantendo record_urls.json "
-                "anterior."
-            )
-
-            final_urls = (
-                existing_urls
-            )
-
-        else:
-            final_urls = []
+        final_urls = []
 
     print()
     print(
         "=" * 70
     )
+
     print(
         "BUSCA FINALIZADA"
     )
+
     print(
         "=" * 70
     )
@@ -620,31 +893,42 @@ def main():
     )
 
     print(
+        "Meta:",
+        MAX_RECORDS
+    )
+
+    print(
+        "Anos concluídos:",
+        years_processed
+    )
+
+    print(
         "Arquivo:",
         RECORD_URLS_FILE
     )
 
     if (
         len(final_urls)
-        < MAX_RECORDS
+        >= MAX_RECORDS
     ):
+
         print()
         print(
-            "AVISO: coleta incompleta."
+            "Meta atingida."
+        )
+
+    else:
+
+        print()
+        print(
+            "AVISO:"
         )
 
         print(
-            f"Obtidos: {len(final_urls)}"
+            "A meta ainda não "
+            "foi atingida."
         )
 
-        print(
-            f"Meta: {MAX_RECORDS}"
-        )
-
-
-# ============================================================
-# EXECUÇÃO
-# ============================================================
 
 if __name__ == "__main__":
     main()
