@@ -125,14 +125,13 @@ def save_manifest(manifest):
 
 def load_metadata_files():
     """
-    Carrega os arquivos individuais de metadados,
-    respeitando o limite BDTD_MAX_RECORDS.
+    Carrega todos os arquivos individuais de metadados
+    disponíveis na camada Raw.
     """
 
     return sorted(
         METADATA_DIR.glob("*.json")
-    )[:MAX_RECORDS]
-
+    )
 
 # ============================================================
 # URLs
