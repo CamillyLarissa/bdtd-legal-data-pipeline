@@ -16,7 +16,7 @@ from src.config import (
 # ============================================================
 
 NUM_CANDIDATES = int(os.getenv("BDTD_BENCHMARK_CANDIDATES", "10"))
-MIN_WORDS = int(os.getenv("BDTD_BENCHMARK_MIN_WORDS", "150"))
+MIN_WORDS = int(os.getenv("BDTD_BENCHMARK_MIN_WORDS", "100"))
 MIN_PAGE = int(os.getenv("BDTD_BENCHMARK_MIN_PAGE", "5"))
 MAX_TEXT_CHARS = int(os.getenv("BDTD_BENCHMARK_MAX_CHARS", "2500"))
 RANDOM_SEED = int(os.getenv("BDTD_BENCHMARK_SEED", "42"))
@@ -35,30 +35,27 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 def get_json_files(directory: Path) -> list[Path]:
-    """
-    Retorna somente os arquivos JSON correspondentes aos documentos.
-    Arquivos auxiliares, como duplicates.json, são ignorados.
-    """
+    """Retorna apenas os JSONs correspondentes aos documentos."""
     if not directory.exists():
         return []
+
+    ignored_files = {
+        "duplicates.json",
+        "candidates.json",
+        "benchmark_summary.json",
+    }
 
     return sorted(
         file
         for file in directory.glob("*.json")
-        if file.name not in {
-            "duplicates.json",
-            "candidates.json",
-            "benchmark_summary.json",
-        }
+        if file.name not in ignored_files
     )
 
 
 def select_source_directory() -> Path:
     """
-    Usa a camada anonimizada quando ela estiver disponível.
-
-    Enquanto a anonimização ainda não tiver sido concluída,
-    utiliza temporariamente a camada deduplicada.
+    Prioriza a camada anonimizada.
+    Enquanto ela não existir, utiliza a deduplicada.
     """
     anonymized_files = get_json_files(ANONYMIZED_DIR)
 
@@ -84,12 +81,50 @@ def load_document(file: Path) -> dict:
         return json.load(f)
 
 
+def get_pages(data: dict) -> list[dict]:
+    """
+    Obtém as páginas independentemente de estarem
+    no nível principal ou dentro de 'document'.
+    """
+    pages = data.get("pages")
+
+    if isinstance(pages, list):
+        return pages
+
+    document = data.get("document", {})
+
+    if isinstance(document, dict):
+        pages = document.get("pages")
+
+        if isinstance(pages, list):
+            return pages
+
+    return []
+
+
+def get_metadata(data: dict) -> dict:
+    """
+    Obtém os metadados independentemente da posição
+    em que estejam armazenados.
+    """
+    metadata = data.get("metadata")
+
+    if isinstance(metadata, dict):
+        return metadata
+
+    document = data.get("document", {})
+
+    if isinstance(document, dict):
+        metadata = document.get("metadata")
+
+        if isinstance(metadata, dict):
+            return metadata
+
+    return {}
+
+
 def get_metadata_value(metadata: dict, *keys):
-    """
-    Tenta obter um valor utilizando diferentes nomes de campo.
-    Isso ajuda quando metadados de diferentes repositórios
-    possuem pequenas variações.
-    """
+    """Busca o primeiro campo de metadado disponível."""
     for key in keys:
         value = metadata.get(key)
 
@@ -99,43 +134,64 @@ def get_metadata_value(metadata: dict, *keys):
     return None
 
 
+def get_page_number(page: dict):
+    """Obtém o número da página considerando nomes diferentes."""
+    return (
+        page.get("page_number")
+        or page.get("page")
+        or page.get("number")
+    )
+
+
+def get_page_text(page: dict) -> str:
+    """Obtém o conteúdo textual da página."""
+    return (
+        page.get("text")
+        or page.get("content")
+        or ""
+    ).strip()
+
+
 def get_valid_pages(pages: list[dict]) -> list[dict]:
     """
-    Seleciona páginas com quantidade suficiente de texto.
-
-    Preferimos páginas a partir da página 5 para reduzir a
-    probabilidade de selecionar capas, fichas catalográficas
-    ou páginas iniciais.
+    Seleciona páginas com texto suficiente para gerar
+    posteriormente perguntas factuais.
     """
     valid_pages = []
 
     for page in pages:
-        text = page.get("text", "").strip()
+        text = get_page_text(page)
 
-        if len(text.split()) < MIN_WORDS:
-            continue
-
-        valid_pages.append(page)
+        if len(text.split()) >= MIN_WORDS:
+            valid_pages.append(page)
 
     if not valid_pages:
         return []
 
-    pages_after_min = [
-        page
-        for page in valid_pages
-        if page.get("page_number", 0) >= MIN_PAGE
-    ]
+    # Preferência por páginas posteriores à parte pré-textual.
+    pages_after_min = []
 
-    # Caso não haja páginas >= MIN_PAGE, mantém as páginas válidas.
+    for page in valid_pages:
+        page_number = get_page_number(page)
+
+        if isinstance(page_number, int) and page_number >= MIN_PAGE:
+            pages_after_min.append(page)
+
     return pages_after_min or valid_pages
 
 
-def build_candidate(document: dict, file: Path, rng: random.Random):
-    """
-    Seleciona uma página adequada do documento e gera
-    uma instância candidata para futura curadoria humana.
-    """
-    pages = document.get("pages", [])
+def build_candidate(
+    data: dict,
+    file: Path,
+    rng: random.Random,
+):
+    """Cria um candidato para posterior curadoria humana."""
+
+    pages = get_pages(data)
+
+    if not pages:
+        return None
+
     valid_pages = get_valid_pages(pages)
 
     if not valid_pages:
@@ -143,15 +199,22 @@ def build_candidate(document: dict, file: Path, rng: random.Random):
 
     page = rng.choice(valid_pages)
 
-    metadata = document.get("metadata", {})
+    metadata = get_metadata(data)
+
+    document = data.get("document", {})
 
     record_id = (
-        document.get("record_id")
+        data.get("record_id")
+        or (
+            document.get("record_id")
+            if isinstance(document, dict)
+            else None
+        )
         or metadata.get("record_id")
         or file.stem
     )
 
-    text = page.get("text", "").strip()
+    text = get_page_text(page)
 
     return {
         "record_id": record_id,
@@ -178,7 +241,7 @@ def build_candidate(document: dict, file: Path, rng: random.Random):
             "ano",
             "date",
         ),
-        "page": page.get("page_number"),
+        "page": get_page_number(page),
         "word_count": len(text.split()),
         "text": text[:MAX_TEXT_CHARS],
     }
@@ -189,20 +252,27 @@ def build_candidate(document: dict, file: Path, rng: random.Random):
 # ============================================================
 
 def main():
-    BENCHMARK_DIR.mkdir(parents=True, exist_ok=True)
+    BENCHMARK_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     source_dir = select_source_directory()
     files = get_json_files(source_dir)
 
-    logger.info("Documentos disponíveis: %d", len(files))
+    logger.info(
+        "Documentos disponíveis: %d",
+        len(files),
+    )
 
     if not files:
-        logger.error("Nenhum documento encontrado.")
+        logger.error(
+            "Nenhum documento encontrado."
+        )
         return
 
     rng = random.Random(RANDOM_SEED)
 
-    # Embaralhamento determinístico para permitir reprodução.
     files = files.copy()
     rng.shuffle(files)
 
@@ -211,24 +281,27 @@ def main():
     errors = 0
 
     for file in files:
+
         if len(candidates) >= NUM_CANDIDATES:
             break
 
         try:
-            document = load_document(file)
+            data = load_document(file)
 
             candidate = build_candidate(
-                document=document,
-                file=file,
-                rng=rng,
+                data,
+                file,
+                rng,
             )
 
             if candidate is None:
                 ignored += 1
+
                 logger.warning(
                     "Documento sem página adequada: %s",
                     file.stem,
                 )
+
                 continue
 
             candidates.append(candidate)
@@ -250,13 +323,19 @@ def main():
                 exc,
             )
 
-    # --------------------------------------------------------
-    # Salva candidatos
-    # --------------------------------------------------------
+    # ========================================================
+    # SALVA CANDIDATOS
+    # ========================================================
 
-    candidates_file = BENCHMARK_DIR / "candidates.json"
+    candidates_file = (
+        BENCHMARK_DIR / "candidates.json"
+    )
 
-    with candidates_file.open("w", encoding="utf-8") as f:
+    with candidates_file.open(
+        "w",
+        encoding="utf-8",
+    ) as f:
+
         json.dump(
             candidates,
             f,
@@ -264,9 +343,9 @@ def main():
             indent=2,
         )
 
-    # --------------------------------------------------------
-    # Relatório da etapa
-    # --------------------------------------------------------
+    # ========================================================
+    # RELATÓRIO
+    # ========================================================
 
     summary = {
         "source_directory": str(source_dir),
@@ -281,18 +360,22 @@ def main():
             "maximum_text_characters": MAX_TEXT_CHARS,
             "random_seed": RANDOM_SEED,
         },
-        "status": (
-            "candidate_selection_only"
-        ),
+        "status": "candidate_selection_only",
         "note": (
-            "Os candidatos ainda precisam de curadoria humana "
-            "para criação das perguntas e respectivos gabaritos."
+            "Os candidatos precisam de curadoria humana "
+            "para criação das perguntas e dos gabaritos."
         ),
     }
 
-    summary_file = BENCHMARK_DIR / "benchmark_summary.json"
+    summary_file = (
+        BENCHMARK_DIR / "benchmark_summary.json"
+    )
 
-    with summary_file.open("w", encoding="utf-8") as f:
+    with summary_file.open(
+        "w",
+        encoding="utf-8",
+    ) as f:
+
         json.dump(
             summary,
             f,
@@ -301,12 +384,29 @@ def main():
         )
 
     logger.info("=" * 60)
-    logger.info("SELEÇÃO DE CANDIDATOS FINALIZADA")
-    logger.info("Documentos disponíveis: %d", len(files))
-    logger.info("Candidatos selecionados: %d", len(candidates))
-    logger.info("Ignorados: %d", ignored)
-    logger.info("Erros: %d", errors)
-    logger.info("Arquivo: %s", candidates_file)
+    logger.info(
+        "SELEÇÃO DE CANDIDATOS FINALIZADA"
+    )
+    logger.info(
+        "Documentos disponíveis: %d",
+        len(files),
+    )
+    logger.info(
+        "Candidatos selecionados: %d",
+        len(candidates),
+    )
+    logger.info(
+        "Ignorados: %d",
+        ignored,
+    )
+    logger.info(
+        "Erros: %d",
+        errors,
+    )
+    logger.info(
+        "Arquivo: %s",
+        candidates_file,
+    )
 
 
 if __name__ == "__main__":
