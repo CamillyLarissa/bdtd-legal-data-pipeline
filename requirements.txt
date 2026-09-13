@@ -3,4 +3,7 @@ playwright==1.62.0
 requests==2.34.2
 pytest==8.4.2
 pymupdf>=1.24.0
+spacy
 datasketch
+pandas
+pyarrow
