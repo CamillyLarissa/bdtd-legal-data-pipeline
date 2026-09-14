@@ -1,28 +1,102 @@
 """
-Extração dos metadados bibliográficos dos registros da BDTD.
+Extração robusta dos metadados bibliográficos da BDTD.
 
 Entrada:
     data/raw/metadata/record_urls.json
 
 Saída:
     data/raw/metadata/records/<record_id>.json
+    data/raw/metadata/failed_metadata.json
 
-A extração considera diferentes estruturas encontradas
-nas páginas de registros da BDTD.
+Características:
+- preserva metadados válidos já existentes;
+- reprocessa somente arquivos ausentes ou inválidos;
+- faz múltiplas tentativas;
+- aguarda o carregamento real dos metadados;
+- não salva páginas vazias como sucesso;
+- mantém compatibilidade com o downloader.
 """
 
 import json
+import os
+import random
 import re
+import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
 from src.config import (
-    BDTD_HEADLESS,
-    METADATA_DIR,
     RECORD_URLS_FILE,
+    METADATA_DIR,
     create_directories,
 )
+
+
+# ============================================================
+# CONFIGURAÇÕES
+# ============================================================
+
+MAX_RECORDS = int(
+    os.getenv(
+        "BDTD_MAX_RECORDS",
+        "100",
+    )
+)
+
+HEADLESS = (
+    os.getenv(
+        "BDTD_HEADLESS",
+        "true",
+    ).lower()
+    == "true"
+)
+
+MAX_RETRIES = 4
+
+PAGE_TIMEOUT = 60000
+
+METADATA_WAIT_TIMEOUT = 15000
+
+WAIT_BETWEEN_RETRIES = 7
+
+MIN_WAIT_BETWEEN_RECORDS = 2.0
+
+MAX_WAIT_BETWEEN_RECORDS = 4.0
+
+
+# ============================================================
+# JSON
+# ============================================================
+
+def load_json(path: Path):
+    with path.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+        return json.load(file)
+
+
+def save_json(
+    path: Path,
+    data,
+):
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with path.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            data,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
 
 
 # ============================================================
@@ -30,219 +104,251 @@ from src.config import (
 # ============================================================
 
 def normalize_space(
-    value: str | None,
-) -> str | None:
-    """
-    Remove espaços e quebras de linha excedentes.
-    """
-
+    value,
+):
     if value is None:
         return None
 
     value = re.sub(
         r"\s+",
         " ",
-        value,
+        str(value),
     ).strip()
 
     return value or None
 
 
 def extract_record_id(
-    record_url: str,
-) -> str:
-    """
-    Extrai o identificador do registro a partir da URL.
-
-    Exemplo:
-        https://bdtd.ibict.br/vufind/Record/UFSC_abc123
-
-    Retorna:
-        UFSC_abc123
-    """
-
-    return (
+    record_url,
+):
+    parsed = urlparse(
         record_url
-        .rstrip("/")
-        .split("/")[-1]
+    )
+
+    path = parsed.path.rstrip("/")
+
+    record_id = (
+        path.split("/")[-1]
+    )
+
+    return re.sub(
+        r"[^A-Za-z0-9_.-]",
+        "_",
+        record_id,
     )
 
 
 # ============================================================
-# TEXTO DA PÁGINA
+# URLS DOS REGISTROS
+# ============================================================
+
+def load_record_urls():
+    if not RECORD_URLS_FILE.exists():
+        raise FileNotFoundError(
+            f"Arquivo não encontrado: "
+            f"{RECORD_URLS_FILE}"
+        )
+
+    data = load_json(
+        RECORD_URLS_FILE
+    )
+
+    if isinstance(
+        data,
+        list,
+    ):
+        urls = data
+
+    elif isinstance(
+        data,
+        dict,
+    ):
+        urls = data.get(
+            "record_urls",
+            [],
+        )
+
+    else:
+        raise ValueError(
+            "Formato inválido em "
+            f"{RECORD_URLS_FILE}"
+        )
+
+    return urls[:MAX_RECORDS]
+
+
+# ============================================================
+# QUALIDADE DO METADATA
+# ============================================================
+
+def metadata_is_valid(
+    metadata,
+):
+    """
+    Considera válido quando pelo menos dois dos três
+    campos principais foram extraídos.
+
+    Isso evita salvar páginas vazias, mas permite casos
+    raros em que a instituição não informou algum campo.
+    """
+
+    if not isinstance(
+        metadata,
+        dict,
+    ):
+        return False
+
+    important = [
+        metadata.get("title"),
+        metadata.get("year"),
+        metadata.get("author"),
+    ]
+
+    filled = sum(
+        bool(normalize_space(value))
+        for value in important
+    )
+
+    return filled >= 2
+
+
+def existing_metadata_is_valid(
+    path,
+):
+    if not path.exists():
+        return False
+
+    try:
+        metadata = load_json(path)
+
+        return metadata_is_valid(
+            metadata
+        )
+
+    except Exception:
+        return False
+
+
+# ============================================================
+# LINHAS DA PÁGINA
 # ============================================================
 
 def get_page_lines(
     page,
-) -> list[str]:
-    """
-    Retorna todas as linhas textuais úteis da página.
-    """
-
-    body_text = (
-        page.locator("body")
-        .inner_text()
-    )
-
-    lines = [
-        normalize_space(line)
-        for line in body_text.splitlines()
-    ]
-
-    return [
-        line
-        for line in lines
-        if line
-    ]
-
-
-# ============================================================
-# SEÇÃO BIBLIOGRÁFICA
-# ============================================================
-
-def get_bibliographic_lines(
-    page,
-) -> list[str]:
-    """
-    Obtém as linhas referentes aos metadados bibliográficos.
-
-    A BDTD apresenta mais de uma estrutura de página.
-
-    Estrutura 1:
-        Detalhes bibliográficos
-        Ano de defesa:
-        2024
-        Autor(a) principal:
-        ...
-
-    Estrutura 2:
-        Título
-        Ano de defesa:
-        2024
-        Autor(a) principal:
-        ...
-
-    A função suporta os dois casos.
-    """
-
-    lines = get_page_lines(page)
-
-    # ========================================================
-    # ESTRATÉGIA 1
-    # Página contendo "Detalhes bibliográficos"
-    # ========================================================
-
-    for index, line in enumerate(lines):
-
-        if (
-            line.lower().strip()
-            == "detalhes bibliográficos"
-        ):
-
-            start_index = index + 1
-            end_index = len(lines)
-
-            # Alguns layouts possuem outra seção depois.
-            for end in range(
-                start_index,
-                len(lines),
-            ):
-
-                current = (
-                    lines[end]
-                    .lower()
-                    .strip()
-                )
-
-                if current in {
-                    "metadados do item",
-                    "itens relacionados",
-                    "registros relacionados",
-                }:
-                    end_index = end
-                    break
-
-            return lines[
-                start_index:end_index
-            ]
-
-    # ========================================================
-    # ESTRATÉGIA 2
-    # Página sem "Detalhes bibliográficos".
-    #
-    # Procuramos o primeiro campo bibliográfico conhecido.
-    # ========================================================
-
-    first_labels = [
-        "ano de defesa",
-        "ano de publicação",
-        "autor(a) principal",
-        "autor principal",
-    ]
-
-    for index, line in enumerate(lines):
-
-        normalized_line = (
-            line.lower()
-            .strip()
+):
+    try:
+        body = (
+            page.locator("body")
+            .inner_text()
         )
 
-        for label in first_labels:
+    except Exception:
+        return []
 
-            if normalized_line.startswith(
-                label
-            ):
+    result = []
 
-                # Mantém algumas linhas anteriores porque
-                # normalmente incluem o título.
-                start_index = max(
-                    0,
-                    index - 3,
-                )
+    for line in body.splitlines():
 
-                return lines[
-                    start_index:
-                ]
+        line = normalize_space(
+            line
+        )
 
-    # ========================================================
-    # FALLBACK
-    # ========================================================
+        if line:
+            result.append(
+                line
+            )
 
-    return []
+    return result
 
 
 # ============================================================
-# EXTRAÇÃO GENÉRICA DE CAMPO
+# RÓTULOS CONHECIDOS
+# ============================================================
+
+KNOWN_LABELS = [
+    "Ano de defesa",
+    "Ano de publicação",
+    "Autor(a) principal",
+    "Autor principal",
+    "Orientador(a)",
+    "Orientador",
+    "Banca de defesa",
+    "Tipo de documento",
+    "Tipo de acesso",
+    "Idioma",
+    "Instituição de defesa",
+    "Instituição",
+    "Programa de Pós-Graduação",
+    "Programa de Pós Graduação",
+    "Departamento",
+    "País",
+    "Link de acesso",
+    "URL de acesso",
+    "Resumo",
+]
+
+
+def looks_like_label(
+    value,
+):
+    if not value:
+        return False
+
+    normalized = (
+        normalize_space(value)
+        .lower()
+    )
+
+    for label in KNOWN_LABELS:
+
+        label_lower = (
+            label.lower()
+        )
+
+        if (
+            normalized
+            == label_lower
+            or normalized
+            == f"{label_lower}:"
+        ):
+            return True
+
+        if normalized.startswith(
+            f"{label_lower}:"
+        ):
+            return True
+
+    return False
+
+
+# ============================================================
+# EXTRAÇÃO DE CAMPO
 # ============================================================
 
 def extract_field(
-    lines: list[str],
-    labels: list[str],
-) -> str | None:
+    lines,
+    labels,
+):
     """
-    Extrai um campo usando diferentes formatos encontrados
-    na BDTD.
-
-    Exemplos:
+    Suporta:
 
         Ano de defesa: 2024
 
+    e:
+
         Ano de defesa:
         2024
-
-        Autor(a) principal:
-        Souza, Lucas Nicholas Santos de
     """
 
-    for index, line in enumerate(lines):
+    for index, line in enumerate(
+        lines
+    ):
 
         for label in labels:
 
-            # =================================================
-            # FORMATO 1
-            #
-            # Ano de defesa: 2024
-            # =================================================
+            # -----------------------------------------------
+            # Campo e valor na mesma linha
+            # -----------------------------------------------
 
             pattern = (
                 rf"^{re.escape(label)}"
@@ -261,35 +367,46 @@ def extract_field(
                     match.group(1)
                 )
 
-                if value:
+                # Evita algo como:
+                # Instituição:
+                # Programa de Pós-Graduação: ...
+                if (
+                    value
+                    and not looks_like_label(
+                        value
+                    )
+                ):
                     return value
 
-            # =================================================
-            # FORMATO 2
-            #
-            # Ano de defesa:
-            # 2024
-            # =================================================
+            # -----------------------------------------------
+            # Rótulo em uma linha e valor na próxima
+            # -----------------------------------------------
 
-            label_only_pattern = (
+            only_label = (
                 rf"^{re.escape(label)}"
                 rf"\s*:\s*$"
             )
 
             if re.match(
-                label_only_pattern,
+                only_label,
                 line,
                 flags=re.IGNORECASE,
             ):
 
-                if index + 1 < len(lines):
+                if index + 1 >= len(lines):
+                    continue
 
-                    value = normalize_space(
-                        lines[index + 1]
+                value = normalize_space(
+                    lines[index + 1]
+                )
+
+                if (
+                    value
+                    and not looks_like_label(
+                        value
                     )
-
-                    if value:
-                        return value
+                ):
+                    return value
 
     return None
 
@@ -300,125 +417,229 @@ def extract_field(
 
 def extract_title(
     page,
-) -> str | None:
-    """
-    Extrai o título principal do registro.
-    """
-
-    # ========================================================
-    # PRIMEIRA ESTRATÉGIA
-    # Seletores HTML conhecidos
-    # ========================================================
-
+    lines,
+):
     selectors = [
         "h1",
         ".record-title",
         ".title",
-        "h2",
     ]
 
     for selector in selectors:
 
-        locator = page.locator(
-            selector
-        )
-
-        if locator.count() == 0:
-            continue
-
         try:
+
+            locator = page.locator(
+                selector
+            )
+
+            if locator.count() == 0:
+                continue
 
             text = normalize_space(
                 locator.first.inner_text()
             )
 
+            if (
+                text
+                and len(text) > 5
+                and text.lower()
+                not in {
+                    "metadados do item",
+                    "detalhes bibliográficos",
+                }
+            ):
+                return text
+
         except Exception:
             continue
 
+    # --------------------------------------------------------
+    # Fallback:
+    # linha imediatamente anterior ao Ano de defesa
+    # --------------------------------------------------------
+
+    for index, line in enumerate(
+        lines
+    ):
+
+        lower = line.lower()
+
         if (
-            text
-            and len(text) > 5
-            and text.lower()
-            not in {
-                "metadados do item",
-                "detalhes bibliográficos",
-            }
+            lower.startswith(
+                "ano de defesa"
+            )
+            or lower.startswith(
+                "ano de publicação"
+            )
         ):
-            return text
 
-    # ========================================================
-    # SEGUNDA ESTRATÉGIA
-    #
-    # O título normalmente aparece imediatamente antes de:
-    # "Ano de defesa"
-    # ========================================================
+            if index > 0:
 
-    lines = get_page_lines(page)
-
-    labels = [
-        "ano de defesa",
-        "ano de publicação",
-    ]
-
-    for index, line in enumerate(lines):
-
-        current = (
-            line.lower()
-            .strip()
-        )
-
-        for label in labels:
-
-            if current.startswith(label):
-
-                if index > 0:
-
-                    candidate = normalize_space(
+                candidate = (
+                    normalize_space(
                         lines[index - 1]
                     )
+                )
 
-                    if candidate:
-                        return candidate
-
-    # ========================================================
-    # TERCEIRA ESTRATÉGIA
-    # Layout antigo com "Detalhes bibliográficos"
-    # ========================================================
-
-    for index, line in enumerate(lines):
-
-        if (
-            line.lower().strip()
-            == "detalhes bibliográficos"
-            and index > 0
-        ):
-
-            return normalize_space(
-                lines[index - 1]
-            )
+                if (
+                    candidate
+                    and not looks_like_label(
+                        candidate
+                    )
+                ):
+                    return candidate
 
     return None
 
 
 # ============================================================
-# LIMPEZA DE VALORES "NÃO INFORMADO"
+# LINKS EXTERNOS
 # ============================================================
 
-def clean_metadata_value(
-    value: str | None,
-) -> str | None:
+def extract_access_url(
+    page,
+    lines,
+    record_url,
+):
     """
-    Converte valores equivalentes a informação ausente
-    para None.
+    Primeiro tenta o campo textual 'Link de acesso'.
 
-    Exemplo:
-        "Não Informado pela instituição"
-        -> None
+    Caso não exista, procura links externos candidatos.
     """
 
-    if value is None:
+    textual_url = extract_field(
+        lines,
+        [
+            "Link de acesso",
+            "URL de acesso",
+        ],
+    )
+
+    if (
+        textual_url
+        and textual_url.startswith(
+            (
+                "http://",
+                "https://",
+            )
+        )
+    ):
+        return textual_url
+
+    record_host = (
+        urlparse(
+            record_url
+        ).netloc
+    )
+
+    ignored = [
+        "facebook.com",
+        "twitter.com",
+        "x.com/",
+        "instagram.com",
+        "linkedin.com",
+        "creativecommons.org",
+        "google.com",
+    ]
+
+    try:
+        locator = page.locator(
+            "a[href]"
+        )
+
+        count = locator.count()
+
+    except Exception:
         return None
 
+    candidates = []
+
+    for index in range(
+        count
+    ):
+
+        try:
+            href = (
+                locator.nth(index)
+                .get_attribute("href")
+            )
+
+        except Exception:
+            continue
+
+        if not href:
+            continue
+
+        if not href.startswith(
+            (
+                "http://",
+                "https://",
+            )
+        ):
+            continue
+
+        parsed = urlparse(
+            href
+        )
+
+        if (
+            parsed.netloc
+            == record_host
+        ):
+            continue
+
+        lower = href.lower()
+
+        if any(
+            item in lower
+            for item in ignored
+        ):
+            continue
+
+        if href not in candidates:
+            candidates.append(
+                href
+            )
+
+    if not candidates:
+        return None
+
+    # Prioriza links que parecem repositórios acadêmicos.
+    preferred_terms = [
+        "handle",
+        "hdl.handle.net",
+        "repositorio",
+        "repository",
+        "tede",
+        "dspace",
+        ".pdf",
+        "teses",
+        "dissert",
+        "maxwell",
+        "archivum",
+    ]
+
+    for url in candidates:
+
+        lower = url.lower()
+
+        if any(
+            term in lower
+            for term in preferred_terms
+        ):
+            return url
+
+    return candidates[0]
+
+
+# ============================================================
+# LIMPEZA DE VALORES AUSENTES
+# ============================================================
+
+def clean_value(
+    value,
+):
     value = normalize_space(
         value
     )
@@ -428,82 +649,144 @@ def clean_metadata_value(
 
     normalized = (
         value.lower()
-        .strip()
     )
 
-    missing_values = {
+    missing = {
         "não informado",
         "não informado pela instituição",
         "nao informado",
         "nao informado pela instituicao",
         "não disponível",
         "nao disponivel",
+        "[s.n.]",
         "-",
     }
 
-    if normalized in missing_values:
+    if normalized in missing:
         return None
 
     return value
 
 
 # ============================================================
-# EXTRAÇÃO DOS METADADOS
+# ESPERA PELOS METADADOS
 # ============================================================
 
-def extract_metadata_from_page(
+def wait_for_metadata(
     page,
-    record_url: str,
-) -> dict:
+):
     """
-    Extrai os principais metadados bibliográficos
-    do registro atual da BDTD.
+    Espera até a página realmente apresentar metadados
+    bibliográficos.
+
+    Retorna False quando a página não carregou corretamente.
     """
 
-    bibliographic_lines = (
-        get_bibliographic_lines(
-            page
+    try:
+
+        page.wait_for_function(
+            """
+            () => {
+                const text =
+                    (document.body?.innerText || '')
+                    .toLowerCase();
+
+                return (
+                    text.includes('ano de defesa') ||
+                    text.includes('ano de publicação')
+                ) && (
+                    text.includes('autor(a) principal') ||
+                    text.includes('autor principal')
+                );
+            }
+            """,
+            timeout=METADATA_WAIT_TIMEOUT,
         )
-    )
 
-    record_id = extract_record_id(
-        record_url
+        return True
+
+    except Exception:
+        return False
+
+
+# ============================================================
+# DETECÇÃO DE BLOQUEIO
+# ============================================================
+
+def detect_bad_page(
+    page,
+):
+    try:
+
+        text = (
+            page.locator("body")
+            .inner_text()
+            .lower()
+        )
+
+    except Exception:
+        return "empty_page"
+
+    bad_terms = [
+        "too many requests",
+        "access denied",
+        "verificação de segurança",
+        "verificacao de seguranca",
+        "captcha",
+        "temporarily unavailable",
+        "service unavailable",
+        "erro 429",
+    ]
+
+    for term in bad_terms:
+
+        if term in text:
+            return term
+
+    if len(text.strip()) < 100:
+        return "empty_or_incomplete_page"
+
+    return None
+
+
+# ============================================================
+# EXTRAÇÃO DO REGISTRO
+# ============================================================
+
+def extract_record_metadata(
+    page,
+    record_url,
+):
+    lines = get_page_lines(
+        page
     )
 
     metadata = {
-        "record_id": record_id,
+        "record_id": (
+            extract_record_id(
+                record_url
+            )
+        ),
 
         "source": "BDTD",
 
         "record_url": record_url,
 
-        # ----------------------------------------------------
-        # Título
-        # ----------------------------------------------------
-
         "title": extract_title(
-            page
+            page,
+            lines,
         ),
 
-        # ----------------------------------------------------
-        # Ano
-        # ----------------------------------------------------
-
         "year": extract_field(
-            bibliographic_lines,
+            lines,
             [
                 "Ano de defesa",
                 "Ano de publicação",
-                "Ano",
             ],
         ),
 
-        # ----------------------------------------------------
-        # Autor
-        # ----------------------------------------------------
-
         "author": extract_field(
-            bibliographic_lines,
+            lines,
             [
                 "Autor(a) principal",
                 "Autor principal",
@@ -512,128 +795,81 @@ def extract_metadata_from_page(
             ],
         ),
 
-        # ----------------------------------------------------
-        # Orientador
-        # ----------------------------------------------------
-
         "advisor": extract_field(
-            bibliographic_lines,
+            lines,
             [
                 "Orientador(a)",
                 "Orientador",
             ],
         ),
 
-        # ----------------------------------------------------
-        # Tipo de documento
-        # ----------------------------------------------------
-
         "document_type": extract_field(
-            bibliographic_lines,
+            lines,
             [
                 "Tipo de documento",
             ],
         ),
 
-        # ----------------------------------------------------
-        # Tipo de acesso
-        # ----------------------------------------------------
-
         "access_type": extract_field(
-            bibliographic_lines,
+            lines,
             [
                 "Tipo de acesso",
             ],
         ),
 
-        # ----------------------------------------------------
-        # Idioma
-        # ----------------------------------------------------
-
         "language": extract_field(
-            bibliographic_lines,
+            lines,
             [
                 "Idioma",
             ],
         ),
 
-        # ----------------------------------------------------
-        # Instituição
-        # ----------------------------------------------------
-
         "institution": extract_field(
-            bibliographic_lines,
+            lines,
             [
                 "Instituição de defesa",
                 "Instituição",
             ],
         ),
 
-        # ----------------------------------------------------
-        # Programa
-        # ----------------------------------------------------
-
         "graduate_program": extract_field(
-            bibliographic_lines,
+            lines,
             [
                 "Programa de Pós-Graduação",
                 "Programa de Pós Graduação",
             ],
         ),
 
-        # ----------------------------------------------------
-        # Departamento
-        # ----------------------------------------------------
-
         "department": extract_field(
-            bibliographic_lines,
+            lines,
             [
                 "Departamento",
             ],
         ),
 
-        # ----------------------------------------------------
-        # País
-        # ----------------------------------------------------
-
         "country": extract_field(
-            bibliographic_lines,
+            lines,
             [
                 "País",
                 "Pais",
             ],
         ),
 
-        # ----------------------------------------------------
-        # Link externo
-        # ----------------------------------------------------
-
-        "access_url": extract_field(
-            bibliographic_lines,
-            [
-                "Link de acesso",
-                "URL de acesso",
-                "Acesso",
-            ],
+        "access_url": extract_access_url(
+            page,
+            lines,
+            record_url,
         ),
 
-        # ----------------------------------------------------
-        # Resumo
-        # ----------------------------------------------------
-
         "abstract": extract_field(
-            bibliographic_lines,
+            lines,
             [
                 "Resumo",
             ],
         ),
     }
 
-    # ========================================================
-    # LIMPEZA
-    # ========================================================
-
-    fields_to_clean = [
+    for key in [
         "title",
         "year",
         "author",
@@ -647,171 +883,54 @@ def extract_metadata_from_page(
         "country",
         "access_url",
         "abstract",
-    ]
+    ]:
 
-    for field in fields_to_clean:
-
-        metadata[field] = (
-            clean_metadata_value(
-                metadata.get(field)
-            )
+        metadata[key] = clean_value(
+            metadata.get(key)
         )
 
     return metadata
 
 
 # ============================================================
-# CARREGAMENTO DAS URLs
-# ============================================================
-
-def load_record_urls() -> list[str]:
-    """
-    Carrega as URLs coletadas pela etapa search_records.
-
-    Aceita:
-
-    Formato atual:
-        {
-            "record_urls": [...]
-        }
-
-    Formato antigo:
-        [...]
-    """
-
-    if not RECORD_URLS_FILE.exists():
-
-        raise FileNotFoundError(
-            f"Arquivo não encontrado: "
-            f"{RECORD_URLS_FILE}"
-        )
-
-    with open(
-        RECORD_URLS_FILE,
-        "r",
-        encoding="utf-8",
-    ) as file:
-
-        data = json.load(file)
-
-    # ========================================================
-    # FORMATO ANTIGO
-    # ========================================================
-
-    if isinstance(
-        data,
-        list,
-    ):
-        return data
-
-    # ========================================================
-    # FORMATO ATUAL
-    # ========================================================
-
-    if isinstance(
-        data,
-        dict,
-    ):
-
-        record_urls = data.get(
-            "record_urls",
-            [],
-        )
-
-        if isinstance(
-            record_urls,
-            list,
-        ):
-            return record_urls
-
-    raise ValueError(
-        "Formato inválido em "
-        f"{RECORD_URLS_FILE}"
-    )
-
-
-# ============================================================
-# SALVAMENTO
-# ============================================================
-
-def save_metadata(
-    metadata: dict,
-) -> Path:
-    """
-    Salva os metadados individuais do registro.
-    """
-
-    record_id = metadata[
-        "record_id"
-    ]
-
-    output_file = (
-        METADATA_DIR
-        / f"{record_id}.json"
-    )
-
-    with open(
-        output_file,
-        "w",
-        encoding="utf-8",
-    ) as file:
-
-        json.dump(
-            metadata,
-            file,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    return output_file
-
-
-# ============================================================
 # EXECUÇÃO
 # ============================================================
 
-def run() -> None:
-    """
-    Executa a extração dos metadados de todos os
-    registros coletados anteriormente.
-    """
-
+def run():
     create_directories()
 
-    record_urls = load_record_urls()
+    record_urls = (
+        load_record_urls()
+    )
+
+    failed_file = (
+        METADATA_DIR.parent
+        / "failed_metadata.json"
+    )
 
     print(
         "Registros encontrados:",
         len(record_urls),
     )
 
-    success = 0
-    errors = 0
+    print(
+        "Diretório:",
+        METADATA_DIR,
+    )
 
-    missing_title = 0
-    missing_year = 0
-    missing_author = 0
+    valid_existing = 0
+    recovered = 0
+    failed_count = 0
 
-    # ========================================================
-    # PLAYWRIGHT
-    # ========================================================
+    failures = []
 
     with sync_playwright() as playwright:
 
         browser = (
             playwright.chromium.launch(
-                headless=BDTD_HEADLESS,
+                headless=HEADLESS,
             )
         )
-
-        context = browser.new_context(
-            viewport={
-                "width": 1440,
-                "height": 900,
-            }
-        )
-
-        page = context.new_page()
 
         # ====================================================
         # REGISTROS
@@ -822,8 +941,19 @@ def run() -> None:
             start=1,
         ):
 
+            record_id = (
+                extract_record_id(
+                    record_url
+                )
+            )
+
+            output_file = (
+                METADATA_DIR
+                / f"{record_id}.json"
+            )
+
             print()
-            print("=" * 60)
+            print("=" * 70)
 
             print(
                 f"[{index}/"
@@ -831,72 +961,172 @@ def run() -> None:
             )
 
             print(
-                record_url
+                record_id
             )
 
-            try:
+            # ------------------------------------------------
+            # Já existe e está bom
+            # ------------------------------------------------
 
-                # --------------------------------------------
-                # Abre registro
-                # --------------------------------------------
+            if existing_metadata_is_valid(
+                output_file
+            ):
 
-                page.goto(
-                    record_url,
-                    wait_until="domcontentloaded",
-                    timeout=60000,
+                print(
+                    "Metadata válido já existe. Pulando."
                 )
 
-                # Pequena espera para garantir que os
-                # elementos dinâmicos sejam renderizados.
-                page.wait_for_timeout(
-                    2000
+                valid_existing += 1
+                continue
+
+            # ------------------------------------------------
+            # Existe, mas está ruim
+            # ------------------------------------------------
+
+            if output_file.exists():
+
+                print(
+                    "Metadata existente inválido. "
+                    "Será tentado novamente."
                 )
 
-                # --------------------------------------------
-                # Extrai metadados
-                # --------------------------------------------
+            metadata = None
 
-                metadata = (
-                    extract_metadata_from_page(
-                        page,
+            last_reason = (
+                "metadata_not_loaded"
+            )
+
+            # ------------------------------------------------
+            # Tentativas
+            # ------------------------------------------------
+
+            for attempt in range(
+                1,
+                MAX_RETRIES + 1,
+            ):
+
+                print(
+                    f"Tentativa "
+                    f"{attempt}/"
+                    f"{MAX_RETRIES}"
+                )
+
+                context = (
+                    browser.new_context(
+                        ignore_https_errors=True,
+                        viewport={
+                            "width": 1440,
+                            "height": 900,
+                        },
+                    )
+                )
+
+                page = (
+                    context.new_page()
+                )
+
+                try:
+
+                    page.goto(
                         record_url,
+                        wait_until=(
+                            "domcontentloaded"
+                        ),
+                        timeout=PAGE_TIMEOUT,
                     )
+
+                    loaded = (
+                        wait_for_metadata(
+                            page
+                        )
+                    )
+
+                    if not loaded:
+
+                        bad_page = (
+                            detect_bad_page(
+                                page
+                            )
+                        )
+
+                        last_reason = (
+                            bad_page
+                            or "metadata_not_loaded"
+                        )
+
+                        print(
+                            "Página sem metadados:",
+                            last_reason,
+                        )
+
+                    else:
+
+                        candidate = (
+                            extract_record_metadata(
+                                page,
+                                record_url,
+                            )
+                        )
+
+                        if metadata_is_valid(
+                            candidate
+                        ):
+
+                            metadata = (
+                                candidate
+                            )
+
+                            break
+
+                        last_reason = (
+                            "invalid_metadata"
+                        )
+
+                        print(
+                            "Metadata principal incompleto."
+                        )
+
+                except Exception as error:
+
+                    last_reason = (
+                        type(error).__name__
+                    )
+
+                    print(
+                        "Erro:",
+                        error,
+                    )
+
+                finally:
+
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+
+                if attempt < MAX_RETRIES:
+
+                    print(
+                        f"Aguardando "
+                        f"{WAIT_BETWEEN_RETRIES}s..."
+                    )
+
+                    time.sleep(
+                        WAIT_BETWEEN_RETRIES
+                    )
+
+            # ------------------------------------------------
+            # SUCESSO
+            # ------------------------------------------------
+
+            if metadata:
+
+                save_json(
+                    output_file,
+                    metadata,
                 )
 
-                # --------------------------------------------
-                # Contadores de qualidade
-                # --------------------------------------------
-
-                if not metadata.get(
-                    "title"
-                ):
-                    missing_title += 1
-
-                if not metadata.get(
-                    "year"
-                ):
-                    missing_year += 1
-
-                if not metadata.get(
-                    "author"
-                ):
-                    missing_author += 1
-
-                # --------------------------------------------
-                # Salva
-                # --------------------------------------------
-
-                output_file = (
-                    save_metadata(
-                        metadata
-                    )
-                )
-
-                success += 1
-
-                # --------------------------------------------
-                # Log
-                # --------------------------------------------
+                recovered += 1
 
                 print(
                     "Título:",
@@ -934,62 +1164,110 @@ def run() -> None:
                 )
 
                 print(
-                    "Salvo:",
-                    output_file,
+                    "SALVO ✅"
                 )
 
-            except Exception as error:
+            # ------------------------------------------------
+            # FALHA
+            # ------------------------------------------------
 
-                errors += 1
+            else:
+
+                failed_count += 1
+
+                # Remove JSON antigo inválido para evitar que
+                # outras etapas o interpretem como metadata bom.
+                if output_file.exists():
+
+                    try:
+                        output_file.unlink()
+
+                    except Exception:
+                        pass
+
+                failures.append(
+                    {
+                        "record_id": (
+                            record_id
+                        ),
+                        "record_url": (
+                            record_url
+                        ),
+                        "reason": (
+                            last_reason
+                        ),
+                    }
+                )
 
                 print(
-                    "Erro:",
-                    error,
+                    "FALHA ❌"
                 )
 
-        context.close()
+            # Manifesto incremental
+            save_json(
+                failed_file,
+                failures,
+            )
+
+            # Intervalo aleatório para reduzir frequência
+            # constante de acesso à BDTD.
+            time.sleep(
+                random.uniform(
+                    MIN_WAIT_BETWEEN_RECORDS,
+                    MAX_WAIT_BETWEEN_RECORDS,
+                )
+            )
+
         browser.close()
 
     # ========================================================
-    # RESUMO
+    # RESULTADO FINAL
     # ========================================================
 
+    total_valid = 0
+
+    for path in (
+        METADATA_DIR
+        .glob("*.json")
+    ):
+
+        if existing_metadata_is_valid(
+            path
+        ):
+            total_valid += 1
+
     print()
-    print("=" * 60)
+    print("=" * 70)
 
     print(
         "EXTRAÇÃO FINALIZADA"
     )
 
     print(
-        "Sucesso:",
-        success,
+        "Válidos já existentes:",
+        valid_existing,
     )
 
     print(
-        "Erros:",
-        errors,
+        "Recuperados nesta execução:",
+        recovered,
     )
 
     print(
-        "Sem título:",
-        missing_title,
+        "Falhas:",
+        failed_count,
     )
 
     print(
-        "Sem ano:",
-        missing_year,
+        "Total de metadados válidos:",
+        total_valid,
     )
 
     print(
-        "Sem autor:",
-        missing_author,
+        "Falhas salvas em:",
+        failed_file,
     )
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 if __name__ == "__main__":
     run()
